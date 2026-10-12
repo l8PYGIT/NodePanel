@@ -212,6 +212,10 @@ type connectionInfoResponse struct {
 	SubToken    string          `json:"sub_token"`
 	Note        string          `json:"note"`
 	HostInfo    string          `json:"host_info,omitempty"`
+	CoreType    string          `json:"core_type,omitempty"`
+	Domains     []string        `json:"domains,omitempty"`
+	MaxUsers    int             `json:"max_users,omitempty"`
+	ActiveUsers int             `json:"active_users,omitempty"`
 }
 
 // filterInbounds filters an inbounds JSON object ({"inbounds":[...]}) so only
@@ -273,7 +277,7 @@ func (a *API) subscriptionConnection(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	inbounds := filterInbounds(a.resolveInbounds(ctx, node), sub.AllowedInbounds)
-	writeJSON(w, http.StatusOK, connectionInfoResponse{
+	resp := connectionInfoResponse{
 		NodeName:    node.Name,
 		GRPCAddress: grpcAddressFor(node.Address, node.GRPCPort),
 		Protocol:    "grpc",
@@ -282,7 +286,16 @@ func (a *API) subscriptionConnection(w http.ResponseWriter, r *http.Request) {
 		SubToken:    sub.SubToken,
 		Note:        "Add this node in your PasarGuard panel with the gRPC address, protocol grpc, the certificate, and your customer API key. Replicate the inbound(s) exactly (port/protocol/network/TLS/SNI) so user links work.",
 		HostInfo:    node.HostInfo,
-	})
+		CoreType:    sub.CoreType,
+		Domains:     sub.Domains,
+		MaxUsers:    sub.MaxUsers,
+	}
+	if sub.NodeTenantID != "" {
+		if uv, err := a.clientForNode(node).TenantUsage(ctx, sub.NodeTenantID); err == nil && uv != nil {
+			resp.ActiveUsers = uv.ActiveUsers
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (a *API) listSubscriptions(w http.ResponseWriter, r *http.Request) {

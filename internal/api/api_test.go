@@ -830,3 +830,163 @@ func TestCollectorUserThresholdUnlimitedUsersIgnored(t *testing.T) {
 	}
 }
 
+func TestSubPageRendersUserCapacityAndCoreTypeBadge(t *testing.T) {
+	const masterKey = "node-master"
+	fake, srv := newFakeNode(masterKey, 5000)
+	defer srv.Close()
+
+	fake.mu.Lock()
+	fake.inboundsJSON = `{"inbounds":[{"tag":"vless-reality","port":443},{"tag":"trojan","port":8443}]}`
+	fake.activeUsers = 5
+	fake.mu.Unlock()
+
+	a := newTestAPI(t)
+	h := a.Router()
+	nodeID := registerTestNode(t, h, srv.URL, masterKey)
+
+	cust := decode[map[string]any](t, call(t, h, http.MethodPost, "/api/v1/customers", map[string]any{"name": "test-buyer"}))
+	customerID := cust["id"].(string)
+
+	maxUsers := 10
+	plan := decode[map[string]any](t, call(t, h, http.MethodPost, "/api/v1/plans", map[string]any{
+		"name":             "Plan-Dedicated-Cap",
+		"quota_bytes":      104857600,
+		"duration_days":    30,
+		"max_users":        maxUsers,
+		"allowed_inbounds": []string{"vless-reality"},
+		"core_type":        "dedicated",
+	}))
+	planID := plan["id"].(string)
+
+	subResp := decode[subscriptionResponse](t, call(t, h, http.MethodPost, "/api/v1/customers/"+customerID+"/subscriptions", map[string]any{
+		"plan_id": planID,
+		"node_id": nodeID,
+		"domains": []string{"sub1.example.com", "sub2.example.com"},
+	}))
+
+	subToken := subResp.Subscription.SubToken
+
+	// 1. GET /sub/{token} HTML rendering
+	req := httptest.NewRequest(http.MethodGet, "/sub/"+subToken, nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /sub/%s: %d body=%s", subToken, rec.Code, rec.Body.String())
+	}
+	html := rec.Body.String()
+
+	// Verify core type badge
+	if !strings.Contains(html, "هسته اختصاصی") {
+		t.Errorf("HTML should contain core type badge 'هسته اختصاصی', got: %s", html)
+	}
+
+	// Verify user capacity info and progress meter
+	if !strings.Contains(html, "ظرفیت کاربر: 5 / 10 کاربر") {
+		t.Errorf("HTML should contain user capacity 'ظرفیت کاربر: 5 / 10 کاربر', got: %s", html)
+	}
+	if !strings.Contains(html, `width:50%`) {
+		t.Errorf("HTML should contain user capacity progress meter width:50%%, got: %s", html)
+	}
+
+	// Verify filtered inbounds (should contain vless-reality, should not contain trojan)
+	if !strings.Contains(html, "vless-reality") {
+		t.Errorf("HTML should contain filtered inbound 'vless-reality', got: %s", html)
+	}
+	if strings.Contains(html, "trojan") {
+		t.Errorf("HTML should NOT contain filtered-out inbound 'trojan', got: %s", html)
+	}
+
+	// Verify dedicated domains section
+	if !strings.Contains(html, "sub1.example.com") {
+		t.Errorf("HTML should contain dedicated domain 'sub1.example.com', got: %s", html)
+	}
+	if !strings.Contains(html, "دامنه‌های اختصاصی") {
+		t.Errorf("HTML should contain 'دامنه‌های اختصاصی', got: %s", html)
+	}
+
+	// 2. GET /sub/{token}/info JSON endpoint
+	infoReq := httptest.NewRequest(http.MethodGet, "/sub/"+subToken+"/info", nil)
+	infoRec := httptest.NewRecorder()
+	h.ServeHTTP(infoRec, infoReq)
+	if infoRec.Code != http.StatusOK {
+		t.Fatalf("GET /sub/%s/info: %d", subToken, infoRec.Code)
+	}
+	var info subInfoResponse
+	if err := json.Unmarshal(infoRec.Body.Bytes(), &info); err != nil {
+		t.Fatalf("unmarshal subInfoResponse: %v", err)
+	}
+	if info.ActiveUsers != 5 {
+		t.Errorf("subInfo.ActiveUsers = %d, want 5", info.ActiveUsers)
+	}
+	if info.MaxUsers != 10 {
+		t.Errorf("subInfo.MaxUsers = %d, want 10", info.MaxUsers)
+	}
+	if info.CoreType != "dedicated" {
+		t.Errorf("subInfo.CoreType = %s, want dedicated", info.CoreType)
+	}
+	if len(info.Domains) != 2 || info.Domains[0] != "sub1.example.com" {
+		t.Errorf("subInfo.Domains = %v, want [sub1.example.com sub2.example.com]", info.Domains)
+	}
+
+	// 3. GET /api/v1/subscriptions/{id}/connection JSON endpoint
+	connRR := call(t, h, http.MethodGet, "/api/v1/subscriptions/"+subResp.Subscription.ID+"/connection", nil)
+	if connRR.Code != http.StatusOK {
+		t.Fatalf("GET connection: %d body=%s", connRR.Code, connRR.Body.String())
+	}
+	var connResp connectionInfoResponse
+	if err := json.Unmarshal(connRR.Body.Bytes(), &connResp); err != nil {
+		t.Fatalf("unmarshal connectionInfoResponse: %v", err)
+	}
+	if connResp.CoreType != "dedicated" {
+		t.Errorf("connResp.CoreType = %s, want dedicated", connResp.CoreType)
+	}
+	if connResp.MaxUsers != 10 {
+		t.Errorf("connResp.MaxUsers = %d, want 10", connResp.MaxUsers)
+	}
+	if connResp.ActiveUsers != 5 {
+		t.Errorf("connResp.ActiveUsers = %d, want 5", connResp.ActiveUsers)
+	}
+	if len(connResp.Domains) != 2 || connResp.Domains[0] != "sub1.example.com" {
+		t.Errorf("connResp.Domains = %v, want [sub1.example.com sub2.example.com]", connResp.Domains)
+	}
+}
+
+func TestSubPageRendersSharedDefaultWithoutCapacityBar(t *testing.T) {
+	const masterKey = "node-master"
+	_, srv := newFakeNode(masterKey, 2000)
+	defer srv.Close()
+
+	a := newTestAPI(t)
+	h := a.Router()
+	nodeID := registerTestNode(t, h, srv.URL, masterKey)
+
+	cust := decode[map[string]any](t, call(t, h, http.MethodPost, "/api/v1/customers", map[string]any{"name": "shared-buyer"}))
+	plan := decode[map[string]any](t, call(t, h, http.MethodPost, "/api/v1/plans", map[string]any{
+		"name":          "Plan-Shared-Unlimited",
+		"quota_bytes":   104857600,
+		"duration_days": 30,
+	}))
+	subResp := decode[subscriptionResponse](t, call(t, h, http.MethodPost, "/api/v1/customers/"+cust["id"].(string)+"/subscriptions", map[string]any{
+		"plan_id": plan["id"].(string),
+		"node_id": nodeID,
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/sub/"+subResp.Subscription.SubToken, nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /sub: %d", rec.Code)
+	}
+	html := rec.Body.String()
+
+	if !strings.Contains(html, "هسته اشتراکی") {
+		t.Errorf("HTML should contain core type badge 'هسته اشتراکی', got: %s", html)
+	}
+	if strings.Contains(html, "ظرفیت کاربر:") {
+		t.Errorf("HTML should NOT contain user capacity progress bar for max_users=0")
+	}
+	if strings.Contains(html, "دامنه‌های اختصاصی") {
+		t.Errorf("HTML should NOT contain dedicated domains section when no domains exist")
+	}
+}
+

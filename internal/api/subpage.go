@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"html/template"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -26,6 +27,10 @@ type subInfoResponse struct {
 	CertPEM     string          `json:"cert_pem"`
 	APIKey      string          `json:"api_key"`
 	Inbounds    json.RawMessage `json:"inbounds"`
+	ActiveUsers int             `json:"active_users"`
+	MaxUsers    int             `json:"max_users"`
+	CoreType    string          `json:"core_type"`
+	Domains     []string        `json:"domains,omitempty"`
 }
 
 // loadSubInfoByToken builds the public info for a subscription token. The node
@@ -36,13 +41,17 @@ func (a *API) loadSubInfoByToken(ctx context.Context, token string) (*subInfoRes
 		return nil, false
 	}
 	info := &subInfoResponse{
-		Status:     sub.Status,
-		QuotaBytes: sub.QuotaBytes,
-		UsedBytes:  sub.UsedBytes,
-		EndAt:      sub.EndAt,
-		Protocol:   "grpc",
-		APIKey:     sub.APIKey,
-		Inbounds:   json.RawMessage(`{"inbounds":[]}`),
+		Status:      sub.Status,
+		QuotaBytes:  sub.QuotaBytes,
+		UsedBytes:   sub.UsedBytes,
+		EndAt:       sub.EndAt,
+		Protocol:    "grpc",
+		APIKey:      sub.APIKey,
+		Inbounds:    json.RawMessage(`{"inbounds":[]}`),
+		MaxUsers:    sub.MaxUsers,
+		CoreType:    sub.CoreType,
+		Domains:     sub.Domains,
+		ActiveUsers: 0,
 	}
 	if r := sub.QuotaBytes - sub.UsedBytes; r > 0 {
 		info.RemainBytes = r
@@ -61,6 +70,11 @@ func (a *API) loadSubInfoByToken(ctx context.Context, token string) (*subInfoRes
 		cctx, cancel := context.WithTimeout(ctx, 12*time.Second)
 		defer cancel()
 		info.Inbounds = filterInbounds(a.resolveInbounds(cctx, node), sub.AllowedInbounds)
+		if sub.NodeTenantID != "" {
+			if uv, err := a.clientForNode(node).TenantUsage(cctx, sub.NodeTenantID); err == nil && uv != nil {
+				info.ActiveUsers = uv.ActiveUsers
+			}
+		}
 	}
 	return info, true
 }
@@ -103,10 +117,24 @@ func (a *API) subPage(w http.ResponseWriter, r *http.Request) {
 			pct = 100
 		}
 	}
+	userPct := 0
+	if info.MaxUsers > 0 {
+		userPct = int(info.ActiveUsers * 100 / info.MaxUsers)
+		if userPct > 100 {
+			userPct = 100
+		}
+	}
 	expiry := "—"
 	if info.EndAt > 0 {
 		expiry = time.Unix(info.EndAt, 0).Format("2006-01-02")
 	}
+
+	coreType := info.CoreType
+	if coreType == "" {
+		coreType = "shared"
+	}
+
+	domainsStr := strings.Join(info.Domains, "\n")
 
 	data := subPageData{
 		NodeName:    info.NodeName,
@@ -123,6 +151,14 @@ func (a *API) subPage(w http.ResponseWriter, r *http.Request) {
 		APIKey:      info.APIKey,
 		CertPEM:     info.CertPEM,
 		Inbounds:    inboundsPretty.String(),
+		ActiveUsers: info.ActiveUsers,
+		MaxUsers:    info.MaxUsers,
+		UserPct:     userPct,
+		HasMaxUsers: info.MaxUsers > 0,
+		CoreType:    coreType,
+		CoreTypeFa:  coreTypeFa(coreType),
+		Domains:     domainsStr,
+		HasDomains:  len(info.Domains) > 0,
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
@@ -137,6 +173,22 @@ type subPageData struct {
 	Expiry                                           string
 	DaysLeft                                         int64
 	GRPCAddress, Protocol, APIKey, CertPEM, Inbounds string
+	ActiveUsers, MaxUsers, UserPct                   int
+	HasMaxUsers                                      bool
+	CoreType, CoreTypeFa                             string
+	Domains                                          string
+	HasDomains                                       bool
+}
+
+func coreTypeFa(s string) string {
+	switch s {
+	case "dedicated":
+		return "هسته اختصاصی"
+	case "shared":
+		return "هسته اشتراکی"
+	default:
+		return "هسته اشتراکی"
+	}
 }
 
 func statusFa(s string) string {
@@ -187,6 +239,7 @@ const subPageHTML = `<!doctype html>
   h2{font-size:15px;color:var(--mut);margin:0 0 12px;font-weight:600}
   .badge{display:inline-block;padding:3px 12px;border-radius:999px;font-size:13px}
   .active{background:rgba(34,197,94,.15);color:var(--ok)} .expired{background:rgba(239,68,68,.15);color:var(--danger)} .suspended{background:rgba(245,158,11,.15);color:var(--warn)}
+  .dedicated{background:rgba(99,102,241,.15);color:var(--ac)} .shared{background:rgba(148,163,184,.15);color:var(--mut)}
   .bar{background:#0b1220;border-radius:999px;height:12px;overflow:hidden;margin:8px 0}
   .bar > i{display:block;height:100%;background:linear-gradient(90deg,#6366f1,#22c55e)}
   .row{display:flex;flex-wrap:wrap;gap:16px}
@@ -203,17 +256,33 @@ const subPageHTML = `<!doctype html>
 <div class="wrap">
   <div class="card">
     <h1>اشتراک نود {{.NodeName}}</h1>
-    <span class="badge {{.Status}}">{{.StatusFa}}</span>
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+      <span class="badge {{.Status}}">{{.StatusFa}}</span>
+      <span class="badge {{.CoreType}}">{{.CoreTypeFa}}</span>
+    </div>
     <div class="bar"><i style="width:{{.Pct}}%"></i></div>
     <div class="row">
       <div><div class="lbl">مصرف</div><div class="val">{{.Used}} / {{.Quota}}</div></div>
       <div><div class="lbl">باقی‌مانده</div><div class="val">{{.Remaining}}</div></div>
       <div><div class="lbl">انقضا</div><div class="val">{{.Expiry}} ({{.DaysLeft}} روز)</div></div>
     </div>
+    {{if .HasMaxUsers}}
+    <div style="margin-top:16px">
+      <div class="lbl">ظرفیت کاربر: {{.ActiveUsers}} / {{.MaxUsers}} کاربر</div>
+      <div class="bar"><i style="width:{{.UserPct}}%"></i></div>
+    </div>
+    {{end}}
   </div>
 
   <div class="card">
     <h2>این مقادیر را در نود پنل PasarGuard خودت وارد کن</h2>
+    {{if .HasDomains}}
+    <div class="field">
+      <div class="lbl">دامنه‌های اختصاصی</div>
+      <textarea id="domains" rows="3" readonly>{{.Domains}}</textarea>
+      <button onclick="cp('domains')">کپی دامنه‌ها</button>
+    </div>
+    {{end}}
     <div class="field">
       <div class="lbl">آدرس gRPC</div>
       <input class="copy" id="addr" readonly value="{{.GRPCAddress}}"/>
