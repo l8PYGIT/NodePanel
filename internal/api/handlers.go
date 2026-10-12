@@ -43,10 +43,14 @@ func (a *API) listCustomers(w http.ResponseWriter, _ *http.Request) {
 // --- Plans ---
 
 type createPlanRequest struct {
-	Name         string `json:"name"`
-	QuotaBytes   int64  `json:"quota_bytes"`
-	DurationDays int    `json:"duration_days"`
-	MaxUsers     int    `json:"max_users"`
+	Name            string   `json:"name"`
+	QuotaBytes      int64    `json:"quota_bytes"`
+	DurationDays    int      `json:"duration_days"`
+	MaxUsers        int      `json:"max_users"`
+	AllowedInbounds []string `json:"allowed_inbounds,omitempty"`
+	CoreType        string   `json:"core_type"`
+	MaxIPs          int      `json:"max_ips"`
+	SpeedLimitMbps  int      `json:"speed_limit_mbps"`
 }
 
 func (a *API) createPlan(w http.ResponseWriter, r *http.Request) {
@@ -63,8 +67,19 @@ func (a *API) createPlan(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "quota_bytes and duration_days must be positive")
 		return
 	}
+	if req.CoreType == "" {
+		req.CoreType = "shared"
+	}
+	if req.CoreType != "shared" && req.CoreType != "dedicated" {
+		writeError(w, http.StatusBadRequest, "core_type must be shared or dedicated")
+		return
+	}
+	if req.MaxUsers < 0 || req.MaxIPs < 0 || req.SpeedLimitMbps < 0 {
+		writeError(w, http.StatusBadRequest, "max_users, max_ips, and speed_limit_mbps must be non-negative")
+		return
+	}
 
-	p, err := a.store.CreatePlan(req.Name, req.QuotaBytes, req.DurationDays, req.MaxUsers)
+	p, err := a.store.CreatePlanExtended(req.Name, req.QuotaBytes, req.DurationDays, req.MaxUsers, req.AllowedInbounds, req.CoreType, req.MaxIPs, req.SpeedLimitMbps)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to create plan")
 		return

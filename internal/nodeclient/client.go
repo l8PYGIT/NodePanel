@@ -158,12 +158,18 @@ type UsageView struct {
 
 // CreateTenantRequest provisions a tenant on the node.
 type CreateTenantRequest struct {
-	ID               string `json:"id"`
-	APIKey           string `json:"api_key"`
-	QuotaBytes       int64  `json:"quota_bytes"`
-	CreditLimitBytes int64  `json:"credit_limit_bytes"`
-	ExpireAt         int64  `json:"expire_at"`
-	PeriodID         uint64 `json:"period_id,omitempty"`
+	ID               string   `json:"id"`
+	APIKey           string   `json:"api_key"`
+	QuotaBytes       int64    `json:"quota_bytes"`
+	CreditLimitBytes int64    `json:"credit_limit_bytes"`
+	ExpireAt         int64    `json:"expire_at"`
+	PeriodID         uint64   `json:"period_id,omitempty"`
+	AllowedInbounds  []string `json:"allowed_inbounds,omitempty"`
+	MaxUsers         int      `json:"max_users"`
+	CoreType         string   `json:"core_type,omitempty"`
+	MaxIPs           int      `json:"max_ips,omitempty"`
+	SpeedLimitMbps   int      `json:"speed_limit_mbps,omitempty"`
+	Domains          []string `json:"domains,omitempty"`
 }
 
 // SetQuotaRequest updates a tenant's quota/credit/expiry.

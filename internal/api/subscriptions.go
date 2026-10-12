@@ -18,9 +18,15 @@ import (
 )
 
 type createSubscriptionRequest struct {
-	PlanID           string `json:"plan_id"`
-	NodeID           string `json:"node_id"`
-	CreditLimitBytes int64  `json:"credit_limit_bytes"`
+	PlanID           string   `json:"plan_id"`
+	NodeID           string   `json:"node_id"`
+	CreditLimitBytes int64    `json:"credit_limit_bytes"`
+	AllowedInbounds  []string `json:"allowed_inbounds,omitempty"`
+	MaxUsers         *int     `json:"max_users,omitempty"`
+	CoreType         string   `json:"core_type,omitempty"`
+	MaxIPs           *int     `json:"max_ips,omitempty"`
+	SpeedLimitMbps   *int     `json:"speed_limit_mbps,omitempty"`
+	Domains          []string `json:"domains,omitempty"`
 }
 
 type subscriptionResponse struct {
@@ -58,6 +64,46 @@ func (a *API) createSubscription(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	allowedInbounds := plan.AllowedInbounds
+	if len(req.AllowedInbounds) > 0 {
+		allowedInbounds = req.AllowedInbounds
+	}
+	if allowedInbounds == nil {
+		allowedInbounds = []string{}
+	}
+
+	maxUsers := plan.MaxUsers
+	if req.MaxUsers != nil {
+		maxUsers = *req.MaxUsers
+	}
+
+	coreType := plan.CoreType
+	if req.CoreType != "" {
+		coreType = req.CoreType
+	}
+	if coreType == "" {
+		coreType = "shared"
+	}
+	if coreType != "shared" && coreType != "dedicated" {
+		writeError(w, http.StatusBadRequest, "core_type must be shared or dedicated")
+		return
+	}
+
+	maxIPs := plan.MaxIPs
+	if req.MaxIPs != nil {
+		maxIPs = *req.MaxIPs
+	}
+
+	speedLimitMbps := plan.SpeedLimitMbps
+	if req.SpeedLimitMbps != nil {
+		speedLimitMbps = *req.SpeedLimitMbps
+	}
+
+	domains := req.Domains
+	if domains == nil {
+		domains = []string{}
+	}
+
 	now := time.Now().Unix()
 	endAt := now + int64(plan.DurationDays)*86400
 	rawKey := uuid.NewString()
@@ -72,6 +118,12 @@ func (a *API) createSubscription(w http.ResponseWriter, r *http.Request) {
 		QuotaBytes:       plan.QuotaBytes,
 		CreditLimitBytes: req.CreditLimitBytes,
 		ExpireAt:         endAt,
+		AllowedInbounds:  allowedInbounds,
+		MaxUsers:         maxUsers,
+		CoreType:         coreType,
+		MaxIPs:           maxIPs,
+		SpeedLimitMbps:   speedLimitMbps,
+		Domains:          domains,
 	}); err != nil {
 		writeError(w, http.StatusBadGateway, "failed to provision tenant on node: "+err.Error())
 		return
@@ -99,6 +151,12 @@ func (a *API) createSubscription(w http.ResponseWriter, r *http.Request) {
 		EndAt:            endAt,
 		QuotaBytes:       plan.QuotaBytes,
 		CreditLimitBytes: req.CreditLimitBytes,
+		AllowedInbounds:  allowedInbounds,
+		MaxUsers:         maxUsers,
+		CoreType:         coreType,
+		MaxIPs:           maxIPs,
+		SpeedLimitMbps:   speedLimitMbps,
+		Domains:          domains,
 	}
 	if err := a.store.CreateSubscription(sub); err != nil {
 		rollbackTenant()
@@ -156,6 +214,52 @@ type connectionInfoResponse struct {
 	HostInfo    string          `json:"host_info,omitempty"`
 }
 
+// filterInbounds filters an inbounds JSON object ({"inbounds":[...]}) so only
+// inbounds matching the tags in allowedInbounds are kept. If allowedInbounds is
+// empty or contains "*", all inbounds are returned unchanged.
+func filterInbounds(raw json.RawMessage, allowedInbounds []string) json.RawMessage {
+	if len(allowedInbounds) == 0 {
+		return raw
+	}
+	for _, a := range allowedInbounds {
+		if a == "*" {
+			return raw
+		}
+	}
+
+	var doc struct {
+		Inbounds []json.RawMessage `json:"inbounds"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return raw
+	}
+
+	allowedMap := make(map[string]bool, len(allowedInbounds))
+	for _, a := range allowedInbounds {
+		allowedMap[a] = true
+	}
+
+	filtered := make([]json.RawMessage, 0, len(doc.Inbounds))
+	for _, ib := range doc.Inbounds {
+		var item struct {
+			Tag string `json:"tag"`
+		}
+		if err := json.Unmarshal(ib, &item); err == nil && allowedMap[item.Tag] {
+			filtered = append(filtered, ib)
+		}
+	}
+
+	out, err := json.Marshal(struct {
+		Inbounds []json.RawMessage `json:"inbounds"`
+	}{
+		Inbounds: filtered,
+	})
+	if err != nil {
+		return raw
+	}
+	return json.RawMessage(out)
+}
+
 // subscriptionConnection returns everything a customer needs to add this node in
 // their own PasarGuard panel: the gRPC address, the node certificate, and the
 // shareable inbound definitions (so their inbound matches the node's real one).
@@ -168,7 +272,7 @@ func (a *API) subscriptionConnection(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
 
-	inbounds := a.resolveInbounds(ctx, node)
+	inbounds := filterInbounds(a.resolveInbounds(ctx, node), sub.AllowedInbounds)
 	writeJSON(w, http.StatusOK, connectionInfoResponse{
 		NodeName:    node.Name,
 		GRPCAddress: grpcAddressFor(node.Address, node.GRPCPort),

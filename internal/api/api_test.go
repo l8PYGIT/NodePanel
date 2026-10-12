@@ -26,7 +26,8 @@ type fakeNode struct {
 	usedBytes int64
 	// failDelete makes tenant deletion fail, so tests can prove the panel keeps
 	// local state rather than orphaning a live tenant.
-	failDelete bool
+	failDelete   bool
+	inboundsJSON string
 }
 
 func newFakeNode(masterKey string, usedBytes int64) (*fakeNode, *httptest.Server) {
@@ -36,6 +37,17 @@ func newFakeNode(masterKey string, usedBytes int64) (*fakeNode, *httptest.Server
 		_ = json.NewEncoder(w).Encode(nodeclient.Health{Status: "ok", CoreStarted: true, CoreVersion: "26.3.27"})
 	})
 	mux.HandleFunc("/admin/config", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
+	mux.HandleFunc("/admin/inbounds", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		ib := f.inboundsJSON
+		f.mu.Unlock()
+		if ib != "" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(ib))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	})
 	mux.HandleFunc("/admin/tenants", func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("X-API-Key") != f.masterKey {
 			w.WriteHeader(http.StatusUnauthorized)
@@ -359,5 +371,304 @@ func TestRequestLogRedactsSubToken(t *testing.T) {
 		if got := redactPath(in); got != want {
 			t.Errorf("redactPath(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+func TestCreatePlanExtendedFieldsAndValidation(t *testing.T) {
+	a := newTestAPI(t)
+	h := a.Router()
+
+	// 1. Successful plan creation with extended fields
+	rr := call(t, h, http.MethodPost, "/api/v1/plans", map[string]any{
+		"name":             "Dedicated-Vip",
+		"quota_bytes":      104857600,
+		"duration_days":    30,
+		"max_users":        10,
+		"allowed_inbounds": []string{"vless-reality", "trojan"},
+		"core_type":        "dedicated",
+		"max_ips":          3,
+		"speed_limit_mbps": 50,
+	})
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("create plan: %d body=%s", rr.Code, rr.Body.String())
+	}
+	plan := decode[map[string]any](t, rr)
+	if plan["core_type"] != "dedicated" {
+		t.Fatalf("core_type = %v, want dedicated", plan["core_type"])
+	}
+	if int(plan["max_ips"].(float64)) != 3 {
+		t.Fatalf("max_ips = %v, want 3", plan["max_ips"])
+	}
+	if int(plan["speed_limit_mbps"].(float64)) != 50 {
+		t.Fatalf("speed_limit_mbps = %v, want 50", plan["speed_limit_mbps"])
+	}
+	inbounds, ok := plan["allowed_inbounds"].([]any)
+	if !ok || len(inbounds) != 2 || inbounds[0] != "vless-reality" || inbounds[1] != "trojan" {
+		t.Fatalf("allowed_inbounds = %v, want [vless-reality trojan]", plan["allowed_inbounds"])
+	}
+
+	// 2. Default core_type should be "shared" when omitted
+	rr = call(t, h, http.MethodPost, "/api/v1/plans", map[string]any{
+		"name":          "Shared-Default",
+		"quota_bytes":   50000000,
+		"duration_days": 15,
+	})
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("create plan default: %d body=%s", rr.Code, rr.Body.String())
+	}
+	planDef := decode[map[string]any](t, rr)
+	if planDef["core_type"] != "shared" {
+		t.Fatalf("expected default core_type shared, got %v", planDef["core_type"])
+	}
+
+	// 3. Invalid core_type should be rejected with 400
+	rr = call(t, h, http.MethodPost, "/api/v1/plans", map[string]any{
+		"name":          "Invalid-Core",
+		"quota_bytes":   50000000,
+		"duration_days": 15,
+		"core_type":     "something-else",
+	})
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("invalid core_type code = %d, want 400", rr.Code)
+	}
+
+	// 4. Negative values rejected with 400
+	for _, bad := range []map[string]any{
+		{"name": "p", "quota_bytes": 1000, "duration_days": 1, "max_users": -1},
+		{"name": "p", "quota_bytes": 1000, "duration_days": 1, "max_ips": -1},
+		{"name": "p", "quota_bytes": 1000, "duration_days": 1, "speed_limit_mbps": -1},
+	} {
+		rr = call(t, h, http.MethodPost, "/api/v1/plans", bad)
+		if rr.Code != http.StatusBadRequest {
+			t.Fatalf("negative limit %v: code = %d, want 400", bad, rr.Code)
+		}
+	}
+}
+
+func TestCreateSubscriptionLimitsAndOverrides(t *testing.T) {
+	const masterKey = "node-master"
+	fake, srv := newFakeNode(masterKey, 0)
+	defer srv.Close()
+
+	a := newTestAPI(t)
+	h := a.Router()
+	nodeID := registerTestNode(t, h, srv.URL, masterKey)
+
+	cust := decode[map[string]any](t, call(t, h, http.MethodPost, "/api/v1/customers", map[string]any{"name": "buyer1"}))
+	customerID := cust["id"].(string)
+
+	plan := decode[map[string]any](t, call(t, h, http.MethodPost, "/api/v1/plans", map[string]any{
+		"name":             "Plan-Dedicated",
+		"quota_bytes":      104857600,
+		"duration_days":    30,
+		"max_users":        10,
+		"allowed_inbounds": []string{"vless-reality", "vmess-ws"},
+		"core_type":        "dedicated",
+		"max_ips":          5,
+		"speed_limit_mbps": 100,
+	}))
+	planID := plan["id"].(string)
+
+	// 1. Subscription without overrides inherits from plan
+	rr := call(t, h, http.MethodPost, "/api/v1/customers/"+customerID+"/subscriptions", map[string]any{
+		"plan_id": planID,
+		"node_id": nodeID,
+	})
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("create sub: %d body=%s", rr.Code, rr.Body.String())
+	}
+	var subResp subscriptionResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &subResp); err != nil {
+		t.Fatalf("decode sub: %v", err)
+	}
+
+	fake.mu.Lock()
+	createdTenant1 := fake.created[subResp.Subscription.NodeTenantID]
+	fake.mu.Unlock()
+
+	if createdTenant1.CoreType != "dedicated" {
+		t.Fatalf("node CoreType = %v, want dedicated", createdTenant1.CoreType)
+	}
+	if createdTenant1.MaxUsers != 10 {
+		t.Fatalf("node MaxUsers = %v, want 10", createdTenant1.MaxUsers)
+	}
+	if createdTenant1.MaxIPs != 5 {
+		t.Fatalf("node MaxIPs = %v, want 5", createdTenant1.MaxIPs)
+	}
+	if createdTenant1.SpeedLimitMbps != 100 {
+		t.Fatalf("node SpeedLimitMbps = %v, want 100", createdTenant1.SpeedLimitMbps)
+	}
+	if len(createdTenant1.AllowedInbounds) != 2 || createdTenant1.AllowedInbounds[0] != "vless-reality" {
+		t.Fatalf("node AllowedInbounds = %v, want [vless-reality vmess-ws]", createdTenant1.AllowedInbounds)
+	}
+
+	// Verify persisted subscription
+	subStored1, err := a.store.GetSubscription(subResp.Subscription.ID)
+	if err != nil {
+		t.Fatalf("get sub: %v", err)
+	}
+	if subStored1.CoreType != "dedicated" || subStored1.MaxUsers != 10 || subStored1.MaxIPs != 5 || subStored1.SpeedLimitMbps != 100 {
+		t.Fatalf("stored sub mismatch: %+v", subStored1)
+	}
+
+	// 2. Subscription WITH overrides overrides the plan
+	maxUsersOverride := 3
+	maxIPsOverride := 2
+	speedLimitOverride := 25
+	rr = call(t, h, http.MethodPost, "/api/v1/customers/"+customerID+"/subscriptions", map[string]any{
+		"plan_id":          planID,
+		"node_id":          nodeID,
+		"allowed_inbounds": []string{"vless-reality"},
+		"max_users":        &maxUsersOverride,
+		"core_type":        "shared",
+		"max_ips":          &maxIPsOverride,
+		"speed_limit_mbps": &speedLimitOverride,
+		"domains":          []string{"buyer.example.com"},
+	})
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("create sub with overrides: %d body=%s", rr.Code, rr.Body.String())
+	}
+	var subResp2 subscriptionResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &subResp2); err != nil {
+		t.Fatalf("decode sub2: %v", err)
+	}
+
+	fake.mu.Lock()
+	createdTenant2 := fake.created[subResp2.Subscription.NodeTenantID]
+	fake.mu.Unlock()
+
+	if createdTenant2.CoreType != "shared" {
+		t.Fatalf("node CoreType = %v, want shared", createdTenant2.CoreType)
+	}
+	if createdTenant2.MaxUsers != 3 {
+		t.Fatalf("node MaxUsers = %v, want 3", createdTenant2.MaxUsers)
+	}
+	if createdTenant2.MaxIPs != 2 {
+		t.Fatalf("node MaxIPs = %v, want 2", createdTenant2.MaxIPs)
+	}
+	if createdTenant2.SpeedLimitMbps != 25 {
+		t.Fatalf("node SpeedLimitMbps = %v, want 25", createdTenant2.SpeedLimitMbps)
+	}
+	if len(createdTenant2.AllowedInbounds) != 1 || createdTenant2.AllowedInbounds[0] != "vless-reality" {
+		t.Fatalf("node AllowedInbounds = %v, want [vless-reality]", createdTenant2.AllowedInbounds)
+	}
+	if len(createdTenant2.Domains) != 1 || createdTenant2.Domains[0] != "buyer.example.com" {
+		t.Fatalf("node Domains = %v, want [buyer.example.com]", createdTenant2.Domains)
+	}
+
+	// Verify persisted subscription
+	subStored2, err := a.store.GetSubscription(subResp2.Subscription.ID)
+	if err != nil {
+		t.Fatalf("get sub2: %v", err)
+	}
+	if subStored2.CoreType != "shared" || subStored2.MaxUsers != 3 || subStored2.MaxIPs != 2 || subStored2.SpeedLimitMbps != 25 {
+		t.Fatalf("stored sub2 mismatch: %+v", subStored2)
+	}
+	if len(subStored2.Domains) != 1 || subStored2.Domains[0] != "buyer.example.com" {
+		t.Fatalf("stored sub2 domains mismatch: %+v", subStored2.Domains)
+	}
+}
+
+func TestSubscriptionConnectionInboundFiltering(t *testing.T) {
+	const masterKey = "node-master"
+	fake, srv := newFakeNode(masterKey, 0)
+	defer srv.Close()
+
+	fake.mu.Lock()
+	fake.inboundsJSON = `{"inbounds":[{"tag":"vless-reality","port":443},{"tag":"vmess-ws","port":80},{"tag":"trojan","port":8443}]}`
+	fake.mu.Unlock()
+
+	a := newTestAPI(t)
+	h := a.Router()
+	nodeID := registerTestNode(t, h, srv.URL, masterKey)
+
+	cust := decode[map[string]any](t, call(t, h, http.MethodPost, "/api/v1/customers", map[string]any{"name": "buyer2"}))
+	customerID := cust["id"].(string)
+
+	plan := decode[map[string]any](t, call(t, h, http.MethodPost, "/api/v1/plans", map[string]any{
+		"name":             "Plan-Restricted",
+		"quota_bytes":      104857600,
+		"duration_days":    30,
+		"allowed_inbounds": []string{"vless-reality"},
+	}))
+	planID := plan["id"].(string)
+
+	// 1. Subscription with allowed_inbounds = ["vless-reality"]
+	rr := call(t, h, http.MethodPost, "/api/v1/customers/"+customerID+"/subscriptions", map[string]any{
+		"plan_id": planID,
+		"node_id": nodeID,
+	})
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("create sub: %d body=%s", rr.Code, rr.Body.String())
+	}
+	var subResp subscriptionResponse
+	_ = json.Unmarshal(rr.Body.Bytes(), &subResp)
+
+	// Check /api/v1/subscriptions/{id}/connection
+	connRR := call(t, h, http.MethodGet, "/api/v1/subscriptions/"+subResp.Subscription.ID+"/connection", nil)
+	if connRR.Code != http.StatusOK {
+		t.Fatalf("get connection: %d body=%s", connRR.Code, connRR.Body.String())
+	}
+	var connResp connectionInfoResponse
+	if err := json.Unmarshal(connRR.Body.Bytes(), &connResp); err != nil {
+		t.Fatalf("decode connResp: %v", err)
+	}
+
+	var inboundsDoc struct {
+		Inbounds []struct {
+			Tag  string `json:"tag"`
+			Port int    `json:"port"`
+		} `json:"inbounds"`
+	}
+	if err := json.Unmarshal(connResp.Inbounds, &inboundsDoc); err != nil {
+		t.Fatalf("unmarshal filtered inbounds: %v (raw=%s)", err, string(connResp.Inbounds))
+	}
+	if len(inboundsDoc.Inbounds) != 1 || inboundsDoc.Inbounds[0].Tag != "vless-reality" {
+		t.Fatalf("expected only vless-reality, got: %+v", inboundsDoc.Inbounds)
+	}
+
+	// Also check public sub info endpoint /sub/{token}/info
+	subInfoReq := httptest.NewRequest(http.MethodGet, "/sub/"+subResp.Subscription.SubToken+"/info", nil)
+	subInfoRec := httptest.NewRecorder()
+	h.ServeHTTP(subInfoRec, subInfoReq)
+	if subInfoRec.Code != http.StatusOK {
+		t.Fatalf("sub info: %d", subInfoRec.Code)
+	}
+	var subInfo subInfoResponse
+	if err := json.Unmarshal(subInfoRec.Body.Bytes(), &subInfo); err != nil {
+		t.Fatalf("decode subInfo: %v", err)
+	}
+	var subInfoInbounds struct {
+		Inbounds []struct {
+			Tag string `json:"tag"`
+		} `json:"inbounds"`
+	}
+	if err := json.Unmarshal(subInfo.Inbounds, &subInfoInbounds); err != nil {
+		t.Fatalf("unmarshal subInfo inbounds: %v", err)
+	}
+	if len(subInfoInbounds.Inbounds) != 1 || subInfoInbounds.Inbounds[0].Tag != "vless-reality" {
+		t.Fatalf("expected only vless-reality in subInfo, got: %+v", subInfoInbounds.Inbounds)
+	}
+
+	// 2. Wildcard allowed_inbounds = ["*"] returns all 3 inbounds
+	rrWild := call(t, h, http.MethodPost, "/api/v1/customers/"+customerID+"/subscriptions", map[string]any{
+		"plan_id":          planID,
+		"node_id":          nodeID,
+		"allowed_inbounds": []string{"*"},
+	})
+	var subRespWild subscriptionResponse
+	_ = json.Unmarshal(rrWild.Body.Bytes(), &subRespWild)
+
+	connRRWild := call(t, h, http.MethodGet, "/api/v1/subscriptions/"+subRespWild.Subscription.ID+"/connection", nil)
+	var connRespWild connectionInfoResponse
+	_ = json.Unmarshal(connRRWild.Body.Bytes(), &connRespWild)
+	var inboundsWild struct {
+		Inbounds []struct {
+			Tag string `json:"tag"`
+		} `json:"inbounds"`
+	}
+	_ = json.Unmarshal(connRespWild.Inbounds, &inboundsWild)
+	if len(inboundsWild.Inbounds) != 3 {
+		t.Fatalf("expected all 3 inbounds with wildcard, got %d", len(inboundsWild.Inbounds))
 	}
 }
