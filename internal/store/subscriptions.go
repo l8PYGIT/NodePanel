@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -11,7 +12,8 @@ import (
 )
 
 const subColumns = `id, customer_id, plan_id, node_id, node_tenant_id, status, period_id,
-	start_at, end_at, quota_bytes, used_bytes, credit_limit_bytes, notified_threshold, created_at, sub_token, api_key`
+	start_at, end_at, quota_bytes, used_bytes, credit_limit_bytes, notified_threshold, created_at, sub_token, api_key,
+	allowed_inbounds, max_users, core_type, max_ips, speed_limit_mbps, domains, notified_users_threshold`
 
 // CreateSubscription persists a new subscription row.
 func (s *Store) CreateSubscription(sub *domain.Subscription) error {
@@ -30,11 +32,36 @@ func (s *Store) CreateSubscription(sub *domain.Subscription) error {
 	if sub.SubToken == "" {
 		sub.SubToken = newSubToken()
 	}
-	_, err := s.db.Exec(
+	if sub.CoreType == "" {
+		sub.CoreType = "shared"
+	}
+	if sub.AllowedInbounds == nil {
+		sub.AllowedInbounds = []string{}
+	}
+	if sub.Domains == nil {
+		sub.Domains = []string{}
+	}
+	inboundsJSON, err := json.Marshal(sub.AllowedInbounds)
+	if err != nil {
+		return fmt.Errorf("marshal allowed_inbounds: %w", err)
+	}
+	domainsJSON, err := json.Marshal(sub.Domains)
+	if err != nil {
+		return fmt.Errorf("marshal domains: %w", err)
+	}
+	var planID, nodeID any
+	if sub.PlanID != "" {
+		planID = sub.PlanID
+	}
+	if sub.NodeID != "" {
+		nodeID = sub.NodeID
+	}
+	_, err = s.db.Exec(
 		`INSERT INTO subscriptions (`+subColumns+`)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		sub.ID, sub.CustomerID, sub.PlanID, sub.NodeID, sub.NodeTenantID, sub.Status, sub.PeriodID,
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		sub.ID, sub.CustomerID, planID, nodeID, sub.NodeTenantID, sub.Status, sub.PeriodID,
 		sub.StartAt, sub.EndAt, sub.QuotaBytes, sub.UsedBytes, sub.CreditLimitBytes, sub.NotifiedThreshold, sub.CreatedAt, sub.SubToken, sub.APIKey,
+		string(inboundsJSON), sub.MaxUsers, sub.CoreType, sub.MaxIPs, sub.SpeedLimitMbps, string(domainsJSON), sub.NotifiedUsersThreshold,
 	)
 	return err
 }
@@ -42,9 +69,12 @@ func (s *Store) CreateSubscription(sub *domain.Subscription) error {
 func scanSubscription(row interface{ Scan(...any) error }) (*domain.Subscription, error) {
 	var sub domain.Subscription
 	var planID, nodeID, nodeTenantID, subToken, apiKey sql.NullString
+	var inboundsJSON, coreType, domainsJSON sql.NullString
+	var maxUsers, maxIPs, speedLimitMbps, notifiedUsersThreshold sql.NullInt64
 	err := row.Scan(
 		&sub.ID, &sub.CustomerID, &planID, &nodeID, &nodeTenantID, &sub.Status, &sub.PeriodID,
 		&sub.StartAt, &sub.EndAt, &sub.QuotaBytes, &sub.UsedBytes, &sub.CreditLimitBytes, &sub.NotifiedThreshold, &sub.CreatedAt, &subToken, &apiKey,
+		&inboundsJSON, &maxUsers, &coreType, &maxIPs, &speedLimitMbps, &domainsJSON, &notifiedUsersThreshold,
 	)
 	if err != nil {
 		return nil, err
@@ -54,6 +84,26 @@ func scanSubscription(row interface{ Scan(...any) error }) (*domain.Subscription
 	sub.NodeTenantID = nodeTenantID.String
 	sub.SubToken = subToken.String
 	sub.APIKey = apiKey.String
+	if inboundsJSON.Valid && inboundsJSON.String != "" {
+		_ = json.Unmarshal([]byte(inboundsJSON.String), &sub.AllowedInbounds)
+	}
+	if sub.AllowedInbounds == nil {
+		sub.AllowedInbounds = []string{}
+	}
+	sub.MaxUsers = int(maxUsers.Int64)
+	sub.CoreType = coreType.String
+	if sub.CoreType == "" {
+		sub.CoreType = "shared"
+	}
+	sub.MaxIPs = int(maxIPs.Int64)
+	sub.SpeedLimitMbps = int(speedLimitMbps.Int64)
+	if domainsJSON.Valid && domainsJSON.String != "" {
+		_ = json.Unmarshal([]byte(domainsJSON.String), &sub.Domains)
+	}
+	if sub.Domains == nil {
+		sub.Domains = []string{}
+	}
+	sub.NotifiedUsersThreshold = int(notifiedUsersThreshold.Int64)
 	return &sub, nil
 }
 
@@ -74,6 +124,10 @@ func (s *Store) GetSubscriptionByToken(token string) (*domain.Subscription, erro
 		return nil, ErrNotFound
 	}
 	return sub, err
+}
+
+func (s *Store) ListSubscriptions() ([]domain.Subscription, error) {
+	return s.querySubscriptions(`SELECT ` + subColumns + ` FROM subscriptions ORDER BY created_at DESC`)
 }
 
 func (s *Store) ListSubscriptionsByCustomer(customerID string) ([]domain.Subscription, error) {

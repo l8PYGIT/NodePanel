@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	_ "embed"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -64,6 +65,17 @@ func migrate(db *sql.DB) error {
 		`ALTER TABLE nodes ADD COLUMN host_info TEXT`,
 		`ALTER TABLE subscriptions ADD COLUMN sub_token TEXT`,
 		`ALTER TABLE subscriptions ADD COLUMN api_key TEXT`,
+		`ALTER TABLE plans ADD COLUMN allowed_inbounds TEXT NOT NULL DEFAULT '[]'`,
+		`ALTER TABLE plans ADD COLUMN core_type TEXT NOT NULL DEFAULT 'shared'`,
+		`ALTER TABLE plans ADD COLUMN max_ips INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE plans ADD COLUMN speed_limit_mbps INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE subscriptions ADD COLUMN allowed_inbounds TEXT NOT NULL DEFAULT '[]'`,
+		`ALTER TABLE subscriptions ADD COLUMN max_users INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE subscriptions ADD COLUMN core_type TEXT NOT NULL DEFAULT 'shared'`,
+		`ALTER TABLE subscriptions ADD COLUMN max_ips INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE subscriptions ADD COLUMN speed_limit_mbps INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE subscriptions ADD COLUMN domains TEXT NOT NULL DEFAULT '[]'`,
+		`ALTER TABLE subscriptions ADD COLUMN notified_users_threshold INTEGER NOT NULL DEFAULT 0`,
 	}
 	for _, stmt := range addColumns {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
@@ -230,17 +242,35 @@ func (s *Store) ListCustomers() ([]domain.Customer, error) {
 // --- Plans ---
 
 func (s *Store) CreatePlan(name string, quotaBytes int64, durationDays, maxUsers int) (*domain.Plan, error) {
-	p := &domain.Plan{
-		ID:           uuid.NewString(),
-		Name:         name,
-		QuotaBytes:   quotaBytes,
-		DurationDays: durationDays,
-		MaxUsers:     maxUsers,
-		CreatedAt:    time.Now().Unix(),
+	return s.CreatePlanExtended(name, quotaBytes, durationDays, maxUsers, nil, "shared", 0, 0)
+}
+
+func (s *Store) CreatePlanExtended(name string, quotaBytes int64, durationDays, maxUsers int, allowedInbounds []string, coreType string, maxIPs, speedLimitMbps int) (*domain.Plan, error) {
+	if coreType == "" {
+		coreType = "shared"
 	}
-	_, err := s.db.Exec(
-		`INSERT INTO plans (id, name, quota_bytes, duration_days, max_users, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
-		p.ID, p.Name, p.QuotaBytes, p.DurationDays, p.MaxUsers, p.CreatedAt,
+	if allowedInbounds == nil {
+		allowedInbounds = []string{}
+	}
+	inboundsJSON, err := json.Marshal(allowedInbounds)
+	if err != nil {
+		return nil, fmt.Errorf("marshal allowed_inbounds: %w", err)
+	}
+	p := &domain.Plan{
+		ID:              uuid.NewString(),
+		Name:            name,
+		QuotaBytes:      quotaBytes,
+		DurationDays:    durationDays,
+		MaxUsers:        maxUsers,
+		AllowedInbounds: allowedInbounds,
+		CoreType:        coreType,
+		MaxIPs:          maxIPs,
+		SpeedLimitMbps:  speedLimitMbps,
+		CreatedAt:       time.Now().Unix(),
+	}
+	_, err = s.db.Exec(
+		`INSERT INTO plans (id, name, quota_bytes, duration_days, max_users, allowed_inbounds, core_type, max_ips, speed_limit_mbps, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		p.ID, p.Name, p.QuotaBytes, p.DurationDays, p.MaxUsers, string(inboundsJSON), p.CoreType, p.MaxIPs, p.SpeedLimitMbps, p.CreatedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -250,7 +280,7 @@ func (s *Store) CreatePlan(name string, quotaBytes int64, durationDays, maxUsers
 
 func (s *Store) ListPlans() ([]domain.Plan, error) {
 	rows, err := s.db.Query(
-		`SELECT id, name, quota_bytes, duration_days, max_users, created_at FROM plans ORDER BY created_at DESC`,
+		`SELECT id, name, quota_bytes, duration_days, max_users, allowed_inbounds, core_type, max_ips, speed_limit_mbps, created_at FROM plans ORDER BY created_at DESC`,
 	)
 	if err != nil {
 		return nil, err
@@ -260,9 +290,24 @@ func (s *Store) ListPlans() ([]domain.Plan, error) {
 	out := make([]domain.Plan, 0)
 	for rows.Next() {
 		var p domain.Plan
-		if err := rows.Scan(&p.ID, &p.Name, &p.QuotaBytes, &p.DurationDays, &p.MaxUsers, &p.CreatedAt); err != nil {
+		var inboundsJSON sql.NullString
+		var coreType sql.NullString
+		var maxIPs, speedLimit sql.NullInt64
+		if err := rows.Scan(&p.ID, &p.Name, &p.QuotaBytes, &p.DurationDays, &p.MaxUsers, &inboundsJSON, &coreType, &maxIPs, &speedLimit, &p.CreatedAt); err != nil {
 			return nil, err
 		}
+		if inboundsJSON.Valid && inboundsJSON.String != "" {
+			_ = json.Unmarshal([]byte(inboundsJSON.String), &p.AllowedInbounds)
+		}
+		if p.AllowedInbounds == nil {
+			p.AllowedInbounds = []string{}
+		}
+		p.CoreType = coreType.String
+		if p.CoreType == "" {
+			p.CoreType = "shared"
+		}
+		p.MaxIPs = int(maxIPs.Int64)
+		p.SpeedLimitMbps = int(speedLimit.Int64)
 		out = append(out, p)
 	}
 	return out, rows.Err()

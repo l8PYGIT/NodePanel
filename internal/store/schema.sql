@@ -18,30 +18,42 @@ CREATE TABLE IF NOT EXISTS customers (
 );
 
 CREATE TABLE IF NOT EXISTS plans (
-    id            TEXT PRIMARY KEY,
-    name          TEXT NOT NULL,
-    quota_bytes   INTEGER NOT NULL,
-    duration_days INTEGER NOT NULL,
-    max_users     INTEGER NOT NULL DEFAULT 0,       -- 0 = unlimited
-    created_at    INTEGER NOT NULL
+    id               TEXT PRIMARY KEY,
+    name             TEXT NOT NULL,
+    quota_bytes      INTEGER NOT NULL,
+    duration_days    INTEGER NOT NULL,
+    max_users        INTEGER NOT NULL DEFAULT 0,       -- 0 = unlimited
+    allowed_inbounds TEXT NOT NULL DEFAULT '[]',
+    core_type        TEXT NOT NULL DEFAULT 'shared',
+    max_ips          INTEGER NOT NULL DEFAULT 0,
+    speed_limit_mbps INTEGER NOT NULL DEFAULT 0,
+    created_at       INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS subscriptions (
-    id                 TEXT PRIMARY KEY,
-    customer_id        TEXT NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
-    plan_id            TEXT REFERENCES plans(id),
-    node_id            TEXT REFERENCES nodes(id),
-    node_tenant_id     TEXT,                            -- tenant id on the node
-    sub_token          TEXT,                            -- unguessable token for the public subscription page
-    status             TEXT NOT NULL DEFAULT 'active', -- active|suspended|expired
-    period_id          INTEGER NOT NULL DEFAULT 1,
-    start_at           INTEGER NOT NULL,
-    end_at             INTEGER NOT NULL,
-    quota_bytes        INTEGER NOT NULL,
-    used_bytes         INTEGER NOT NULL DEFAULT 0,
-    credit_limit_bytes INTEGER NOT NULL DEFAULT 0,    -- extra allowed bytes before auto-suspend (set by bot)
-    notified_threshold INTEGER NOT NULL DEFAULT 0,    -- highest usage threshold already sent (0/80/95/100)
-    created_at         INTEGER NOT NULL
+    id                       TEXT PRIMARY KEY,
+    customer_id              TEXT NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+    plan_id                  TEXT REFERENCES plans(id),
+    node_id                  TEXT REFERENCES nodes(id),
+    node_tenant_id           TEXT,                            -- tenant id on the node
+    sub_token                TEXT,                            -- unguessable token for the public subscription page
+    api_key                  TEXT,
+    status                   TEXT NOT NULL DEFAULT 'active', -- active|suspended|expired
+    period_id                INTEGER NOT NULL DEFAULT 1,
+    start_at                 INTEGER NOT NULL,
+    end_at                   INTEGER NOT NULL,
+    quota_bytes              INTEGER NOT NULL,
+    used_bytes               INTEGER NOT NULL DEFAULT 0,
+    credit_limit_bytes       INTEGER NOT NULL DEFAULT 0,    -- extra allowed bytes before auto-suspend (set by bot)
+    notified_threshold       INTEGER NOT NULL DEFAULT 0,    -- highest usage threshold already sent (0/80/95/100)
+    allowed_inbounds         TEXT NOT NULL DEFAULT '[]',
+    max_users                INTEGER NOT NULL DEFAULT 0,
+    core_type                TEXT NOT NULL DEFAULT 'shared',
+    max_ips                  INTEGER NOT NULL DEFAULT 0,
+    speed_limit_mbps         INTEGER NOT NULL DEFAULT 0,
+    domains                  TEXT NOT NULL DEFAULT '[]',
+    notified_users_threshold INTEGER NOT NULL DEFAULT 0,
+    created_at               INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_subscriptions_customer ON subscriptions(customer_id);
 

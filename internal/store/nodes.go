@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"time"
 
@@ -144,14 +145,31 @@ func (s *Store) UpdateNodeHealth(id, status, version string, lastSeen int64) err
 // GetPlan loads a plan by id.
 func (s *Store) GetPlan(id string) (*domain.Plan, error) {
 	row := s.db.QueryRow(
-		`SELECT id, name, quota_bytes, duration_days, max_users, created_at FROM plans WHERE id = ?`, id,
+		`SELECT id, name, quota_bytes, duration_days, max_users, allowed_inbounds, core_type, max_ips, speed_limit_mbps, created_at FROM plans WHERE id = ?`, id,
 	)
 	var p domain.Plan
-	err := row.Scan(&p.ID, &p.Name, &p.QuotaBytes, &p.DurationDays, &p.MaxUsers, &p.CreatedAt)
+	var inboundsJSON, coreType sql.NullString
+	var maxIPs, speedLimit sql.NullInt64
+	err := row.Scan(&p.ID, &p.Name, &p.QuotaBytes, &p.DurationDays, &p.MaxUsers, &inboundsJSON, &coreType, &maxIPs, &speedLimit, &p.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
-	return &p, err
+	if err != nil {
+		return nil, err
+	}
+	if inboundsJSON.Valid && inboundsJSON.String != "" {
+		_ = json.Unmarshal([]byte(inboundsJSON.String), &p.AllowedInbounds)
+	}
+	if p.AllowedInbounds == nil {
+		p.AllowedInbounds = []string{}
+	}
+	p.CoreType = coreType.String
+	if p.CoreType == "" {
+		p.CoreType = "shared"
+	}
+	p.MaxIPs = int(maxIPs.Int64)
+	p.SpeedLimitMbps = int(speedLimit.Int64)
+	return &p, nil
 }
 
 // GetCustomer loads a customer by id.

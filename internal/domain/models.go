@@ -12,12 +12,16 @@ type Customer struct {
 
 // Plan is a sellable package. It carries bytes/time/limits only, never price.
 type Plan struct {
-	ID           string `json:"id"`
-	Name         string `json:"name"`
-	QuotaBytes   int64  `json:"quota_bytes"`
-	DurationDays int    `json:"duration_days"`
-	MaxUsers     int    `json:"max_users"`
-	CreatedAt    int64  `json:"created_at"`
+	ID              string   `json:"id"`
+	Name            string   `json:"name"`
+	QuotaBytes      int64    `json:"quota_bytes"`
+	DurationDays    int      `json:"duration_days"`
+	MaxUsers        int      `json:"max_users"`
+	AllowedInbounds []string `json:"allowed_inbounds,omitempty"`
+	CoreType        string   `json:"core_type"` // "shared" | "dedicated"
+	MaxIPs          int      `json:"max_ips"`
+	SpeedLimitMbps  int      `json:"speed_limit_mbps"`
+	CreatedAt       int64    `json:"created_at"`
 }
 
 // Node is a server in the fleet running a node agent. MasterKey is the panel's
@@ -42,22 +46,29 @@ type Node struct {
 
 // Subscription ties a customer+plan to a tenant provisioned on a node.
 type Subscription struct {
-	ID                string `json:"id"`
-	CustomerID        string `json:"customer_id"`
-	PlanID            string `json:"plan_id"`
-	NodeID            string `json:"node_id"`
-	NodeTenantID      string `json:"node_tenant_id"`
-	SubToken          string `json:"sub_token,omitempty"`
-	APIKey            string `json:"-"` // raw customer key, stored for the public sub page
-	Status            string `json:"status"`
-	PeriodID          uint64 `json:"period_id"`
-	StartAt           int64  `json:"start_at"`
-	EndAt             int64  `json:"end_at"`
-	QuotaBytes        int64  `json:"quota_bytes"`
-	UsedBytes         int64  `json:"used_bytes"`
-	CreditLimitBytes  int64  `json:"credit_limit_bytes"`
-	NotifiedThreshold int    `json:"notified_threshold"`
-	CreatedAt         int64  `json:"created_at"`
+	ID                     string   `json:"id"`
+	CustomerID             string   `json:"customer_id"`
+	PlanID                 string   `json:"plan_id"`
+	NodeID                 string   `json:"node_id"`
+	NodeTenantID           string   `json:"node_tenant_id"`
+	SubToken               string   `json:"sub_token,omitempty"`
+	APIKey                 string   `json:"-"` // raw customer key, stored for the public sub page
+	Status                 string   `json:"status"`
+	PeriodID               uint64   `json:"period_id"`
+	StartAt                int64    `json:"start_at"`
+	EndAt                  int64    `json:"end_at"`
+	QuotaBytes             int64    `json:"quota_bytes"`
+	UsedBytes              int64    `json:"used_bytes"`
+	CreditLimitBytes       int64    `json:"credit_limit_bytes"`
+	NotifiedThreshold      int      `json:"notified_threshold"`
+	AllowedInbounds        []string `json:"allowed_inbounds,omitempty"`
+	MaxUsers               int      `json:"max_users"`
+	CoreType               string   `json:"core_type"`
+	MaxIPs                 int      `json:"max_ips"`
+	SpeedLimitMbps         int      `json:"speed_limit_mbps"`
+	Domains                []string `json:"domains,omitempty"`
+	NotifiedUsersThreshold int      `json:"notified_users_threshold"`
+	CreatedAt              int64    `json:"created_at"`
 }
 
 // WebhookEndpoint is a destination the panel notifies (e.g. the sales bot).
