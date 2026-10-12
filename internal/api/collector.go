@@ -79,6 +79,9 @@ func (a *API) collectUsageOnce(ctx context.Context) {
 		// Emit usage threshold / over-quota events (once each per period).
 		a.emitUsageEvents(ctx, sub, uv.UsedBytes)
 
+		// Emit user threshold / limit reached events.
+		a.emitUserEvents(ctx, sub, uv.ActiveUsers)
+
 		// Reflect the node's enforcement decision back into the panel and notify.
 		if uv.Status != "" && uv.Status != sub.Status {
 			_ = a.store.UpdateSubscriptionStatus(sub.ID, uv.Status)
@@ -115,6 +118,48 @@ func (a *API) emitUsageEvents(ctx context.Context, sub domain.Subscription, used
 		a.wh.Emit(ctx, webhook.EventUsageThreshold, data)
 	}
 	_ = a.store.UpdateSubscriptionNotified(sub.ID, level)
+}
+
+// emitUserEvents fires users.threshold (80/90) and users.limit_reached (100) once
+// each per capacity level, tracked via the subscription's notified_users_threshold.
+func (a *API) emitUserEvents(ctx context.Context, sub domain.Subscription, active int) {
+	if sub.MaxUsers <= 0 {
+		return
+	}
+	level := userThresholdLevel(active, sub.MaxUsers)
+	if level <= sub.NotifiedUsersThreshold {
+		return
+	}
+	data := map[string]any{
+		"customer_id":     sub.CustomerID,
+		"subscription_id": sub.ID,
+		"active_users":    active,
+		"max_users":       sub.MaxUsers,
+		"threshold":       level,
+	}
+	if level >= 100 {
+		a.wh.Emit(ctx, webhook.EventUsersLimitReached, data)
+	} else if level == 80 || level == 90 {
+		a.wh.Emit(ctx, webhook.EventUsersThreshold, data)
+	}
+	_ = a.store.UpdateSubscriptionUsersNotified(sub.ID, level)
+}
+
+func userThresholdLevel(active, maxUsers int) int {
+	if maxUsers <= 0 {
+		return 0
+	}
+	pct := active * 100 / maxUsers
+	switch {
+	case pct >= 100:
+		return 100
+	case pct >= 90:
+		return 90
+	case pct >= 80:
+		return 80
+	default:
+		return 0
+	}
 }
 
 func (a *API) emitStatusEvent(ctx context.Context, sub domain.Subscription, newStatus string) {

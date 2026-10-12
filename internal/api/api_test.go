@@ -10,20 +10,23 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/pasarguard/panel/internal/config"
 	"github.com/pasarguard/panel/internal/nodeclient"
 	"github.com/pasarguard/panel/internal/store"
+	"github.com/pasarguard/panel/internal/webhook"
 )
 
 const testToken = "test-token"
 
 // fakeNode emulates a node agent's master admin API for panel tests.
 type fakeNode struct {
-	mu        sync.Mutex
-	masterKey string
-	created   map[string]nodeclient.CreateTenantRequest
-	usedBytes int64
+	mu          sync.Mutex
+	masterKey   string
+	created     map[string]nodeclient.CreateTenantRequest
+	usedBytes   int64
+	activeUsers int
 	// failDelete makes tenant deletion fail, so tests can prove the panel keeps
 	// local state rather than orphaning a live tenant.
 	failDelete   bool
@@ -79,7 +82,13 @@ func newFakeNode(masterKey string, usedBytes int64) (*fakeNode, *httptest.Server
 		}
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/usage"):
-			_ = json.NewEncoder(w).Encode(nodeclient.UsageView{ID: "t", Status: "active", UsedBytes: f.usedBytes, QuotaBytes: 1000})
+			f.mu.Lock()
+			au := f.activeUsers
+			f.mu.Unlock()
+			_ = json.NewEncoder(w).Encode(nodeclient.UsageView{
+				ID: "t", Status: "active", UsedBytes: f.usedBytes, QuotaBytes: 1000,
+				ActiveUsers: au,
+			})
 		default:
 			_ = json.NewEncoder(w).Encode(nodeclient.TenantView{ID: "t", Status: "active"})
 		}
@@ -672,3 +681,152 @@ func TestSubscriptionConnectionInboundFiltering(t *testing.T) {
 		t.Fatalf("expected all 3 inbounds with wildcard, got %d", len(inboundsWild.Inbounds))
 	}
 }
+
+func TestCollectorUserThresholdEvents(t *testing.T) {
+	const masterKey = "node-master"
+	fake, nodeSrv := newFakeNode(masterKey, 100)
+	defer nodeSrv.Close()
+
+	sink, sinkSrv := newWebhookSink("wh-secret")
+	defer sinkSrv.Close()
+
+	a := newTestAPI(t)
+	h := a.Router()
+
+	// Register webhook
+	if rr := call(t, h, http.MethodPost, "/api/v1/webhooks", map[string]any{
+		"url": sinkSrv.URL, "secret": "wh-secret", "events": "*",
+	}); rr.Code != http.StatusCreated {
+		t.Fatalf("create webhook: %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	// Register node, customer, plan with max_users=10, create subscription
+	node := decode[map[string]any](t, call(t, h, http.MethodPost, "/api/v1/nodes", map[string]any{
+		"name": "n1", "address": nodeSrv.URL, "master_key": masterKey,
+	}))
+	cust := decode[map[string]any](t, call(t, h, http.MethodPost, "/api/v1/customers", map[string]any{"name": "buyer"}))
+	plan := decode[map[string]any](t, call(t, h, http.MethodPost, "/api/v1/plans", map[string]any{
+		"name": "cap10", "quota_bytes": 1000000, "duration_days": 30, "max_users": 10,
+	}))
+	subResp := decode[subscriptionResponse](t, call(t, h, http.MethodPost, "/api/v1/customers/"+cust["id"].(string)+"/subscriptions", map[string]any{
+		"plan_id": plan["id"].(string), "node_id": node["id"].(string),
+	}))
+	subID := subResp.Subscription.ID
+
+	// Pass 1: activeUsers = 8 (80%) -> users.threshold event
+	fake.mu.Lock()
+	fake.activeUsers = 8
+	fake.mu.Unlock()
+
+	a.collectUsageOnce(context.Background())
+	time.Sleep(100 * time.Millisecond)
+
+	sub, err := a.store.GetSubscription(subID)
+	if err != nil {
+		t.Fatalf("get sub: %v", err)
+	}
+	if sub.NotifiedUsersThreshold != 80 {
+		t.Errorf("sub.NotifiedUsersThreshold = %d, want 80", sub.NotifiedUsersThreshold)
+	}
+
+	// Pass 2: activeUsers still 8 -> no re-emission
+	a.collectUsageOnce(context.Background())
+	time.Sleep(100 * time.Millisecond)
+
+	// Pass 3: activeUsers = 9 (90%) -> users.threshold event
+	fake.mu.Lock()
+	fake.activeUsers = 9
+	fake.mu.Unlock()
+
+	a.collectUsageOnce(context.Background())
+	time.Sleep(100 * time.Millisecond)
+
+	sub, _ = a.store.GetSubscription(subID)
+	if sub.NotifiedUsersThreshold != 90 {
+		t.Errorf("sub.NotifiedUsersThreshold = %d, want 90", sub.NotifiedUsersThreshold)
+	}
+
+	// Pass 4: activeUsers = 10 (100%) -> users.limit_reached event
+	fake.mu.Lock()
+	fake.activeUsers = 10
+	fake.mu.Unlock()
+
+	a.collectUsageOnce(context.Background())
+	time.Sleep(100 * time.Millisecond)
+
+	sub, _ = a.store.GetSubscription(subID)
+	if sub.NotifiedUsersThreshold != 100 {
+		t.Errorf("sub.NotifiedUsersThreshold = %d, want 100", sub.NotifiedUsersThreshold)
+	}
+
+	types := sink.types()
+	var threshold80Count, threshold90Count, limit100Count int
+	for _, env := range sink.events {
+		if env.Type == webhook.EventUsersThreshold {
+			data, _ := json.Marshal(env.Data)
+			var m map[string]any
+			_ = json.Unmarshal(data, &m)
+			if int(m["threshold"].(float64)) == 80 {
+				threshold80Count++
+			} else if int(m["threshold"].(float64)) == 90 {
+				threshold90Count++
+			}
+		} else if env.Type == webhook.EventUsersLimitReached {
+			data, _ := json.Marshal(env.Data)
+			var m map[string]any
+			_ = json.Unmarshal(data, &m)
+			if int(m["threshold"].(float64)) == 100 {
+				limit100Count++
+			}
+		}
+	}
+	if threshold80Count != 1 {
+		t.Errorf("expected 1 users.threshold (80), got %d (all: %v)", threshold80Count, types)
+	}
+	if threshold90Count != 1 {
+		t.Errorf("expected 1 users.threshold (90), got %d (all: %v)", threshold90Count, types)
+	}
+	if limit100Count != 1 {
+		t.Errorf("expected 1 users.limit_reached (100), got %d (all: %v)", limit100Count, types)
+	}
+}
+
+func TestCollectorUserThresholdUnlimitedUsersIgnored(t *testing.T) {
+	const masterKey = "node-master"
+	fake, nodeSrv := newFakeNode(masterKey, 100)
+	defer nodeSrv.Close()
+
+	sink, sinkSrv := newWebhookSink("wh-secret")
+	defer sinkSrv.Close()
+
+	a := newTestAPI(t)
+	h := a.Router()
+
+	_ = call(t, h, http.MethodPost, "/api/v1/webhooks", map[string]any{
+		"url": sinkSrv.URL, "secret": "wh-secret", "events": "*",
+	})
+	node := decode[map[string]any](t, call(t, h, http.MethodPost, "/api/v1/nodes", map[string]any{
+		"name": "n1", "address": nodeSrv.URL, "master_key": masterKey,
+	}))
+	cust := decode[map[string]any](t, call(t, h, http.MethodPost, "/api/v1/customers", map[string]any{"name": "buyer"}))
+	plan := decode[map[string]any](t, call(t, h, http.MethodPost, "/api/v1/plans", map[string]any{
+		"name": "unlimited", "quota_bytes": 1000000, "duration_days": 30, "max_users": 0,
+	}))
+	_ = decode[subscriptionResponse](t, call(t, h, http.MethodPost, "/api/v1/customers/"+cust["id"].(string)+"/subscriptions", map[string]any{
+		"plan_id": plan["id"].(string), "node_id": node["id"].(string),
+	}))
+
+	fake.mu.Lock()
+	fake.activeUsers = 50
+	fake.mu.Unlock()
+
+	a.collectUsageOnce(context.Background())
+	time.Sleep(100 * time.Millisecond)
+
+	for _, ty := range sink.types() {
+		if ty == webhook.EventUsersThreshold || ty == webhook.EventUsersLimitReached {
+			t.Fatalf("unexpected user event for unlimited users plan: %s", ty)
+		}
+	}
+}
+

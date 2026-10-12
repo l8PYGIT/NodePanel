@@ -23,12 +23,25 @@ import (
 
 // Event names emitted by the panel.
 const (
-	EventUsageThreshold = "usage.threshold"
-	EventUsageOverQuota = "usage.over_quota"
-	EventSuspended      = "subscription.suspended"
-	EventResumed        = "subscription.resumed"
-	EventExpired        = "subscription.expired"
+	EventUsageThreshold    = "usage.threshold"
+	EventUsageOverQuota    = "usage.over_quota"
+	EventSuspended         = "subscription.suspended"
+	EventResumed           = "subscription.resumed"
+	EventExpired           = "subscription.expired"
+	EventUsersThreshold    = "users.threshold"
+	EventUsersLimitReached = "users.limit_reached"
 )
+
+// KnownEvents lists all event types emitted by the panel.
+var KnownEvents = []string{
+	EventUsageThreshold,
+	EventUsageOverQuota,
+	EventSuspended,
+	EventResumed,
+	EventExpired,
+	EventUsersThreshold,
+	EventUsersLimitReached,
+}
 
 // Store is the subset of persistence the dispatcher needs.
 type Store interface {

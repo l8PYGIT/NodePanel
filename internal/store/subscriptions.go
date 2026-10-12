@@ -209,6 +209,12 @@ func (s *Store) UpdateSubscriptionNotified(id string, level int) error {
 	return err
 }
 
+// UpdateSubscriptionUsersNotified records the highest user capacity threshold already sent.
+func (s *Store) UpdateSubscriptionUsersNotified(id string, threshold int) error {
+	_, err := s.db.Exec(`UPDATE subscriptions SET notified_users_threshold = ? WHERE id = ?`, threshold, id)
+	return err
+}
+
 // RecordUsage appends a cumulative usage sample for auditing/history.
 func (s *Store) RecordUsage(tenantID, nodeID string, periodID uint64, usedCumulative int64) error {
 	_, err := s.db.Exec(
