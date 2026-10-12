@@ -125,6 +125,27 @@ paths:
                 plan_id: { type: string }
                 node_id: { type: string }
                 credit_limit_bytes: { type: integer, format: int64 }
+                allowed_inbounds:
+                  type: array
+                  items: { type: string }
+                  description: "اینباندهای مجاز (اختیاری؛ بازنویسی پلن)"
+                max_users:
+                  type: integer
+                  description: "سقف کاربر (اختیاری؛ بازنویسی پلن)"
+                core_type:
+                  type: string
+                  enum: [shared, dedicated]
+                  description: "نوع هسته (اختیاری؛ بازنویسی پلن)"
+                max_ips:
+                  type: integer
+                  description: "سقف IP همزمان برای هر کاربر (اختیاری)"
+                speed_limit_mbps:
+                  type: integer
+                  description: "سقف سرعت به مگابیت (اختیاری)"
+                domains:
+                  type: array
+                  items: { type: string }
+                  description: "دامنه‌های اختصاصی مشتری برای هسته اختصاصی و مسیریابی SNI"
       responses:
         "201":
           description: Created
@@ -159,6 +180,21 @@ paths:
                 quota_bytes: { type: integer, format: int64 }
                 duration_days: { type: integer }
                 max_users: { type: integer }
+                core_type:
+                  type: string
+                  enum: [shared, dedicated]
+                  default: shared
+                  description: "نوع هسته: اشتراکی (shared) یا اختصاصی (dedicated)"
+                allowed_inbounds:
+                  type: array
+                  items: { type: string }
+                  description: "اینباندهای مجاز (خالی = همه)"
+                max_ips:
+                  type: integer
+                  description: "سقف IP همزمان برای هر کاربر (۰ = نامحدود)"
+                speed_limit_mbps:
+                  type: integer
+                  description: "سقف سرعت به مگابیت (۰ = نامحدود)"
       responses:
         "201":
           description: Created
@@ -351,7 +387,7 @@ paths:
               properties:
                 url: { type: string }
                 secret: { type: string, description: "برای امضای HMAC-SHA256" }
-                events: { type: string, description: "کاما-جدا یا *", example: "*" }
+                events: { type: string, description: "کاما-جدا یا * (مانند usage.threshold, usage.over_quota, users.threshold, users.limit_reached, subscription.expired)", example: "*" }
       responses:
         "201":
           description: Created
@@ -492,6 +528,12 @@ components:
         quota_bytes: { type: integer, format: int64 }
         duration_days: { type: integer }
         max_users: { type: integer }
+        core_type: { type: string, enum: [shared, dedicated] }
+        allowed_inbounds:
+          type: array
+          items: { type: string }
+        max_ips: { type: integer }
+        speed_limit_mbps: { type: integer }
         created_at: { type: integer, format: int64 }
     Node:
       type: object
@@ -553,6 +595,18 @@ components:
         used_bytes: { type: integer, format: int64 }
         credit_limit_bytes: { type: integer, format: int64 }
         notified_threshold: { type: integer }
+        notified_users_threshold: { type: integer }
+        allowed_inbounds:
+          type: array
+          items: { type: string }
+        max_users: { type: integer }
+        core_type: { type: string, enum: [shared, dedicated] }
+        max_ips: { type: integer }
+        speed_limit_mbps: { type: integer }
+        domains:
+          type: array
+          items: { type: string }
+        active_users: { type: integer }
         created_at: { type: integer, format: int64 }
     SubscriptionResponse:
       type: object
@@ -576,6 +630,11 @@ components:
         protocol: { type: string, example: "grpc" }
         cert_pem: { type: string, description: "گواهی نود برای pin در پنل مشتری" }
         inbounds: { type: object, description: "بخش inbounds نود برای کپی در پنل مشتری" }
+        core_type: { type: string, enum: [shared, dedicated] }
+        domains:
+          type: array
+          items: { type: string }
+          description: "دامنه‌های اختصاصی مشتری در صورت وجود"
         sub_token: { type: string, description: "توکن صفحه‌ی عمومی اشتراک (/sub/{token})" }
         host_info:
           type: string

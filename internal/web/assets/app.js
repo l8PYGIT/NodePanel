@@ -720,12 +720,14 @@ async function viewPlans(view) {
     `<div class="card">${
       plans.length
         ? table(
-            ["نام", "حجم", "مدت (روز)", "سقف کاربر", "ساخته‌شده", "عملیات"],
+            ["نام", "حجم", "مدت (روز)", "سقف کاربر", "هسته", "اینباندها", "ساخته‌شده", "عملیات"],
             plans.map((p) => [
               esc(p.name),
               fmtBytes(p.quota_bytes),
               esc(p.duration_days),
               esc(p.max_users ? p.max_users : "∞"),
+              p.core_type === "dedicated" ? `<span class="badge" style="background:#8b5cf6">اختصاصی</span>` : `<span class="badge">اشتراکی</span>`,
+              esc(p.allowed_inbounds && p.allowed_inbounds.length ? p.allowed_inbounds.join(", ") : "همه"),
               fmtDate(p.created_at),
               `<button class="btn sm danger" data-delplan="${p.id}">حذف</button>`,
             ])
@@ -740,10 +742,21 @@ async function viewPlans(view) {
         { name: "quota_gb", label: "حجم (گیگابایت)", type: "number", placeholder: "100" },
         { name: "duration_days", label: "مدت (روز)", type: "number", placeholder: "30" },
         { name: "max_users", label: "سقف کاربر (۰ = نامحدود)", type: "number", value: "0" },
+        { name: "core_type", label: "نوع هسته", type: "select", options: [
+          { value: "shared", label: "اشتراکی (Shared)" },
+          { value: "dedicated", label: "اختصاصی (Dedicated)" },
+        ], value: "shared" },
+        { name: "allowed_inbounds", label: "اینباندهای مجاز (با کاما جدا کنید؛ خالی = همه)", placeholder: "vless-in, vmess-in", hint: "تگ اینباندهای مجاز نود برای این پلن" },
+        { name: "max_ips", label: "سقف IP همزمان برای هر کاربر (۰ = نامحدود)", type: "number", value: "0" },
+        { name: "speed_limit_mbps", label: "محدودیت سرعت به مگابیت (۰ = نامحدود)", type: "number", value: "0" },
       ],
       async (v) => {
         const quota_bytes = Math.round(parseFloat(v.quota_gb || "0") * GB);
         if (quota_bytes <= 0) throw new Error("حجم باید بزرگ‌تر از صفر باشد");
+        const allowed_inbounds = (v.allowed_inbounds || "")
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean);
         await api("/api/v1/plans", {
           method: "POST",
           body: JSON.stringify({
@@ -751,6 +764,10 @@ async function viewPlans(view) {
             quota_bytes,
             duration_days: parseInt(v.duration_days || "0", 10),
             max_users: parseInt(v.max_users || "0", 10),
+            core_type: v.core_type || "shared",
+            allowed_inbounds: allowed_inbounds,
+            max_ips: parseInt(v.max_ips || "0", 10),
+            speed_limit_mbps: parseInt(v.speed_limit_mbps || "0", 10),
           }),
         });
         toast("پلن ساخته شد");
@@ -789,12 +806,14 @@ async function viewSubscriptions(view) {
   const rowsHTML = (list) =>
     list.length
       ? table(
-          ["مشتری", "نود", "پلن", "وضعیت", "مصرف", "انقضا", "عملیات"],
+          ["مشتری", "نود", "پلن", "وضعیت", "هسته", "کاربران", "مصرف", "انقضا", "عملیات"],
           list.map((s) => [
             esc(s._customer),
             esc(nodeName[s.node_id] || "—"),
             esc(planName[s.plan_id] || "—"),
             badge(s.status),
+            s.core_type === "dedicated" ? `<span class="badge" style="background:#8b5cf6">اختصاصی</span>` : `<span class="badge">اشتراکی</span>`,
+            esc(`${s.active_users || 0} / ${s.max_users ? s.max_users : "∞"}`),
             progress(s.used_bytes, s.quota_bytes),
             fmtDate(s.end_at) + daysLeftLabel(s.end_at),
             subActions(s),
@@ -883,11 +902,25 @@ async function subscriptionModal(customers) {
       { name: "customer_id", label: "مشتری", type: "select", options: customers.map((c) => ({ value: c.id, label: c.name })) },
       { name: "plan_id", label: "پلن", type: "select", options: plans.map((p) => ({ value: p.id, label: `${p.name} (${fmtBytes(p.quota_bytes)})` })) },
       { name: "node_id", label: "نود", type: "select", options: nodes.map((n) => ({ value: n.id, label: `${n.name} — ${STATUS_FA[n.status] || n.status}` })) },
+      { name: "domains", label: "دامنه‌ها (اختیاری برای هسته اختصاصی؛ با کاما جدا کنید)", placeholder: "sub.example.com", hint: "برای هدایت SNI روی هسته اختصاصی" },
+      { name: "allowed_inbounds", label: "اینباندهای مجاز (اختیاری؛ بازنویسی پلن با کاما)", placeholder: "خالی = ارث‌بری از پلن" },
+      { name: "max_users", label: "سقف کاربر (اختیاری؛ خالی = ارث‌بری از پلن)", type: "number", placeholder: "خالی = ارث‌بری از پلن" },
     ],
     async (v) => {
+      const body = { plan_id: v.plan_id, node_id: v.node_id };
+      if (v.domains) {
+        body.domains = v.domains.split(",").map((s) => s.trim()).filter(Boolean);
+      }
+      if (v.allowed_inbounds) {
+        body.allowed_inbounds = v.allowed_inbounds.split(",").map((s) => s.trim()).filter(Boolean);
+      }
+      if (v.max_users !== "" && v.max_users !== undefined) {
+        const mu = parseInt(v.max_users, 10);
+        if (!isNaN(mu) && mu >= 0) body.max_users = mu;
+      }
       const res = await api(`/api/v1/customers/${v.customer_id}/subscriptions`, {
         method: "POST",
-        body: JSON.stringify({ plan_id: v.plan_id, node_id: v.node_id }),
+        body: JSON.stringify(body),
       });
       toast("اشتراک provision شد");
       // Defer so the key modal opens after formModal closes its own modal.
@@ -939,6 +972,8 @@ async function connectionModal(subID) {
     `<p class="muted" style="font-size:12.5px;margin:0 0 10px">این مقادیر را به مشتری بدهید تا نود را در پنل PasarGuard خودش اضافه کند. کلید مشتری فقط هنگام ساخت اشتراک نمایش داده می‌شود.</p>
      ${info.sub_token ? `<div class="field"><label>لینک اشتراک مشتری (کانفیگ + وضعیت حجم/انقضا)</label>
        <div class="row" style="gap:6px;align-items:stretch"><input id="connSub" readonly value="${esc(location.origin + "/sub/" + info.sub_token)}" style="flex:1" /><button class="btn ghost" id="connSubOpen">باز</button></div></div>` : ""}
+     <div class="field"><label>نوع هسته</label><input readonly value="${info.core_type === "dedicated" ? "هسته اختصاصی (Dedicated Core)" : "هسته اشتراکی (Shared)"}" /></div>
+     ${info.domains && info.domains.length ? `<div class="field"><label>دامنه‌های اختصاصی</label><input readonly value="${esc(info.domains.join(", "))}" /></div>` : ""}
      <div class="field"><label>آدرس gRPC</label><input id="connAddr" readonly value="${esc(info.grpc_address)}" /></div>
      <div class="field"><label>پروتکل</label><input readonly value="${esc(info.protocol)}" /></div>
      <div class="field"><label>گواهی نود (Certificate)</label><textarea id="connCert" rows="5" readonly spellcheck="false" style="font-family:ui-monospace,monospace;font-size:12px">${esc(info.cert_pem || "—")}</textarea></div>
@@ -984,6 +1019,8 @@ async function viewWebhooks(view) {
       <p class="muted" style="font-size:13px;line-height:2">
         <span class="mono">usage.threshold</span> (۸۰٪/۹۵٪) ·
         <span class="mono">usage.over_quota</span> ·
+        <span class="mono">users.threshold</span> (۸۰٪/۹۰٪) ·
+        <span class="mono">users.limit_reached</span> (۱۰۰٪) ·
         <span class="mono">subscription.suspended</span> ·
         <span class="mono">subscription.resumed</span> ·
         <span class="mono">subscription.expired</span><br/>
