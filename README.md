@@ -2,23 +2,43 @@
 
 پنل اصلی (Control Plane) برای **فروش دسترسی نود با سهمیه‌ی حجم**: مدیریت **چند نود (fleet)**، مشتری/پلن/اشتراک/سهمیه، جمع‌آوری مصرف و expose برای بیلینگ بیرونی (ربات فروش)، با **API مستند (OpenAPI)** و **پنل وب ریسپانسیو**.
 
-> Repo: `https://github.com/loopy-iri/NodePanel`
-> نودِ چند-مستأجری در ریپوی جدا: `https://github.com/loopy-iri/NodeAgent`
+> Repo: `https://github.com/loopy-iri/NodePanel`  
+> نودِ چند-مستأجری در ریپوی جدا: `https://github.com/loopy-iri/NodeAgent`  
+> 📖 **راهنمای کامل (نصب، فروش، اتصال مشتری، API):** [`docs/wiki/`](docs/wiki/Home.md)
 
-> 📖 **راهنمای کامل (نصب، فروش، اتصال مشتری، API):** [`docs/wiki/`](docs/wiki/Home.md) — نسخه‌ی تب Wiki روی ریپوی NodeAgent منتشر شده است.
+---
+
+## معماری سیستم و تفکیک هسته‌ها (Architecture)
+
+![معماری هسته اشتراکی و اختصاصی](docs/images/architecture.svg)
+
+---
+
+## ماتریس دسترسی‌های خریدار و کنترل ظرفیت (Buyer Permissions & Governance)
+
+![کنترل دسترسی خریدار و هشدارهای وب‌هوک](docs/images/buyer-permissions.svg)
+
+---
 
 ## مرز مسئولیت
-پنل **منطق پول ندارد** (کیف‌پول/قیمت/پرداخت در ربات فروش است). فقط بایت/زمان/وضعیت را مدیریت و مصرف/overage را از طریق API + webhook expose می‌کند.
+پنل **منطق پول ندارد** (کیف‌پول/قیمت/پرداخت در ربات فروش است). فقط بایت/زمان/وضعیت و مجوزها را مدیریت کرده و مصرف/ظرفیت را از طریق API + webhook به ربات expose می‌کند.
 
-## ویژگی‌ها
-- مدیریت **چند نود** با master key + TLS (pin گواهی نود یا TOFU خودکار)؛ **پورت gRPC** قابل تنظیم در ثبت نود.
-- مشتری/پلن/اشتراک: ساخت، provision روی نود (ساخت tenant + کلید یک‌بار)، suspend/resume/topup/renew/delete.
-- **جزئیات نود**: نمایش IP/هاست، پورت سرویس و gRPC، پروتکل و **گواهی** با دکمه‌ی کپی (`GET /api/v1/nodes/{id}`).
-- **اطلاعات اتصال مشتری**: آدرس gRPC + گواهی + inboundهای واقعی نود برای تحویل به مشتری (`GET /api/v1/subscriptions/{id}/connection`، `GET /api/v1/nodes/{id}/inbounds`).
-- **Usage collector**: pull مصرف تجمعی از نودها + تجمیع per-customer + بازتاب وضعیت.
-- **Webhook با امضای HMAC**: `usage.threshold`, `usage.over_quota`, `subscription.suspended/resumed/expired`.
-- **پنل وب**: داشبورد/نودها/مشتری‌ها/پلن‌ها/اشتراک‌ها/وب‌هوک‌ها، ریسپانسیو، RTL، چندتم (light/dark/midnight/emerald)، ویرایشگر کانفیگ هسته‌ی نود (no-cache تا بعد از آپدیت UI تازه شود).
-- **OpenAPI 3** روی `/openapi.yaml` و Swagger UI روی `/docs`.
+## ویژگی‌های کلیدی
+- **هسته اختصاصی در برابر هسته اشتراکی (`core_type`):**
+  - **هسته اشتراکی (`shared`):** کاربران چندین خریدار روی یک هسته Xray سبک تجمیع و با emailهای مجزا تفکیک می‌شوند.
+  - **هسته اختصاصی (`dedicated`):** خریدار یک پروسس Xray مستقل روی پورت‌های داخلی (`11000+`) دریافت می‌کند و می‌تواند کانفیگ کامل خود را از طریق پنل PasarGuard اعمال کند. ترافیک روی پورت 443 با **مسیریاب SNI** بر اساس دامنه‌های خریدار تفکیک و هدایت می‌شود.
+- **تفکیک و فیلتر اینباندها (`allowed_inbounds`):** مشخص کردن دقیق پروتکل‌ها و اینباندهایی که خریدار مجاز به استفاده از آن‌هاست (مثلاً فقط `vless-in` یا `reality-in`). سایر اینباندها از دید خریدار مخفی و مسدود می‌شوند.
+- **کنترل سقف کاربران (`max_users`):** اعمال محدودیت سخت‌افزاری بر تعداد کاربرانی که خریدار می‌تواند در پنل خود اضافه کند. در صورت تکمیل ظرفیت، درخواست رد می‌شود (`HTTP 400 Bad Request` و gRPC `ResourceExhausted`).
+- **کنترل کیفیت سرویس (QoS):** محدودیت سرعت بر حسب مگابیت (`speed_limit_mbps`) و سقف IP همزمان برای هر کاربر (`max_ips`) جهت جلوگیری از اکانت‌فروشی غیرمجاز.
+- **هشدارهای پیشگیرانه ظرفیت (Webhooks):**
+  - وب‌هوک مصرف حجم: `usage.threshold` (در ۸۰٪ و ۹۵٪) و `usage.over_quota` (در ۱۰۰٪).
+  - وب‌هوک ظرفیت کاربران: `users.threshold` (در ۸۰٪ و ۹۰٪) و `users.limit_reached` (در ۱۰۰٪) جهت پیشنهاد تمدید یا ارتقای پلن به خریدار.
+- **صفحه عمومی خریدار (`/sub/{token}`):**
+  - نوار وضعیت دوگانه (Dual Meters): نمایش درصد مصرف حجم گیگابایتی + ظرفیت اسلات کاربران.
+  - نشان نوع هسته (`هسته اختصاصی` یا `هسته اشتراکی`) و لیست دامنه‌های متصل.
+- **مدیریت چند نود با پین گواهی TLS / TOFU خودکار.**
+- **پنل وب کامل ادمین (SPA):** داشبورد، مدیریت نودها، مشتری‌ها، پلن‌ها، اشتراک‌ها، وب‌هوک‌ها، RTL، چندتم (light/dark/midnight/emerald).
+- **OpenAPI 3.0 و Swagger UI** روی `/openapi.yaml` و `/docs`.
 
 ## اجرا
 
@@ -50,10 +70,7 @@ $env:PANEL_API_TOKEN="local-dev-token-please-change-me"; go run ./cmd/panel
 | `PANEL_API_TOKEN` | **الزامی** | توکن Bearer برای `/api/*` — حداقل ۲۴ کاراکتر |
 | `PANEL_COLLECT_INTERVAL` | `30s` | بازه‌ی usage collector |
 
-`PANEL_API_TOKEN` پیش‌فرض ندارد و پنل بدون آن بالا نمی‌آید. این توکن تنها لایه‌ی
-احراز هویت جلوی APIای است که `master_key`، `core_key` و گواهی نودها را برمی‌گرداند،
-پس یک مقدار تصادفی بسازید:
-
+`PANEL_API_TOKEN` پیش‌فرض ندارد و پنل بدون آن بالا نمی‌آید:
 ```bash
 openssl rand -hex 32
 ```
@@ -61,9 +78,9 @@ openssl rand -hex 32
 ## ساختار
 ```
 cmd/panel/            entrypoint
-internal/store/       SQLite + schema
+internal/store/       SQLite + schema + migrations
 internal/nodeclient/  client نود (master key + pin/TOFU)
-internal/api/         REST API + collector + lifecycle
-internal/webhook/     dispatcher امضاشده
+internal/api/         REST API + collector + subpage + lifecycle
+internal/webhook/     dispatcher امضاشده HMAC-SHA256
 internal/web/         پنل وب embed‌شده + openapi.yaml + Swagger UI
 ```
