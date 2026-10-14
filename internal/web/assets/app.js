@@ -78,9 +78,10 @@ function toast(msg, type = "ok") {
   wrap.appendChild(t);
   setTimeout(() => t.remove(), 3800);
 }
-function modal(title, bodyHTML, onMount) {
+function modal(title, bodyHTML, onMount, extraClass = "") {
   const root = document.getElementById("modalRoot");
-  root.innerHTML = `<div class="modal-bg"><div class="modal" role="dialog" aria-modal="true"><h3>${title}</h3><div>${bodyHTML}</div></div></div>`;
+  const cls = extraClass ? `modal ${extraClass}` : "modal";
+  root.innerHTML = `<div class="modal-bg"><div class="${cls}" role="dialog" aria-modal="true"><h3>${title}</h3><div>${bodyHTML}</div></div></div>`;
   const bg = root.firstElementChild;
   bg.addEventListener("click", (e) => { if (e.target === bg) closeModal(); });
   const onKey = (e) => { if (e.key === "Escape") { closeModal(); document.removeEventListener("keydown", onKey); } };
@@ -187,7 +188,9 @@ function boot() {
   if (!getToken()) openTokenModal();
   route();
 }
-document.addEventListener("DOMContentLoaded", boot);
+if (typeof document !== "undefined") {
+  document.addEventListener("DOMContentLoaded", boot);
+}
 
 /* ===================== Shared view helpers ===================== */
 function sectionHead(title, actionsHTML) {
@@ -255,6 +258,316 @@ async function guard(fn) {
 }
 const GB = 1024 * 1024 * 1024;
 
+/* ==============================================================
+   RFC 7748 Montgomery Ladder Curve25519 & Reality Key Generation
+   Zero dependencies; bit-for-bit matches Xray-core `xray x25519`.
+   ============================================================== */
+function curve25519(scalar, point = 9n) {
+  const p = (1n << 255n) - 19n;
+  const a24 = 121665n;
+  const mul = (a, b) => (a * b) % p;
+  const add = (a, b) => (a + b) % p;
+  const sub = (a, b) => (a - b + p) % p;
+  function inv(a) {
+    let res = 1n, base = a, exp = p - 2n;
+    while (exp > 0n) {
+      if (exp & 1n) res = mul(res, base);
+      base = mul(base, base);
+      exp >>= 1n;
+    }
+    return res;
+  }
+  let x1 = point, x2 = 1n, z2 = 0n, x3 = point, z3 = 1n, swap = 0;
+  for (let t = 254; t >= 0; t--) {
+    const k_t = Number((scalar >> BigInt(t)) & 1n);
+    swap ^= k_t;
+    if (swap) { [x2, x3] = [x3, x2]; [z2, z3] = [z3, z2]; }
+    swap = k_t;
+    const A = add(x2, z2), AA = mul(A, A);
+    const B = sub(x2, z2), BB = mul(B, B);
+    const E = sub(AA, BB);
+    const C = add(x3, z3), D = sub(x3, z3);
+    const DA = mul(D, A), CB = mul(C, B);
+    x3 = mul(add(DA, CB), add(DA, CB));
+    z3 = mul(x1, mul(sub(DA, CB), sub(DA, CB)));
+    x2 = mul(AA, BB);
+    z2 = mul(E, add(AA, mul(a24, E)));
+  }
+  if (swap) { [x2, x3] = [x3, x2]; [z2, z3] = [z3, z2]; }
+  return mul(x2, inv(z2));
+}
+
+function generateRealityKeys() {
+  const rand = (typeof crypto !== "undefined" && crypto.getRandomValues)
+    ? crypto.getRandomValues(new Uint8Array(32))
+    : new Uint8Array(32).map(() => Math.floor(Math.random() * 256));
+  // RFC 7748 clamping
+  rand[0] &= 248;
+  rand[31] &= 127;
+  rand[31] |= 64;
+  let scalar = 0n;
+  for (let i = 0; i < 32; i++) scalar += BigInt(rand[i]) << (8n * BigInt(i));
+  const pubBig = curve25519(scalar);
+  const pubBytes = new Uint8Array(32);
+  for (let i = 0; i < 32; i++) pubBytes[i] = Number((pubBig >> (8n * BigInt(i))) & 0xffn);
+
+  function b64url(u8) {
+    let bin = "";
+    for (let i = 0; i < u8.length; i++) bin += String.fromCharCode(u8[i]);
+    const b64 = (typeof btoa !== "undefined") ? btoa(bin) : Buffer.from(bin, "binary").toString("base64");
+    return b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+
+  const sidBytes = (typeof crypto !== "undefined" && crypto.getRandomValues)
+    ? crypto.getRandomValues(new Uint8Array(8))
+    : new Uint8Array(8).map(() => Math.floor(Math.random() * 256));
+  let shortId = "";
+  for (let i = 0; i < sidBytes.length; i++) shortId += sidBytes[i].toString(16).padStart(2, "0");
+
+  return {
+    privateKey: b64url(rand),
+    publicKey: b64url(pubBytes),
+    shortId,
+  };
+}
+
+/* ==============================================================
+   Xray Config Parser & Serializer (Bidirectional JSON <-> Visual Model)
+   ============================================================== */
+function parseXrayConfig(jsonStr) {
+  let parsed;
+  try {
+    parsed = typeof jsonStr === "string" ? JSON.parse(jsonStr) : jsonStr;
+  } catch (e) {
+    return { error: "JSON نامعتبر است: " + e.message, inbounds: [], outbounds: [], rawOther: {} };
+  }
+
+  if (!parsed || typeof parsed !== "object") {
+    return { error: "کانفیگ نامعتبر است", inbounds: [], outbounds: [], rawOther: {} };
+  }
+
+  const inbounds = Array.isArray(parsed.inbounds) ? parsed.inbounds.map((ib, idx) => {
+    const ss = ib.streamSettings || {};
+    const ws = ss.wsSettings || {};
+    const grpc = ss.grpcSettings || {};
+    const xhttp = ss.xhttpSettings || ss.splithttpSettings || {};
+    const httpupgrade = ss.httpupgradeSettings || {};
+    const kcp = ss.kcpSettings || {};
+    const h2 = ss.httpSettings || {};
+    const tls = ss.tlsSettings || {};
+    const reality = ss.realitySettings || {};
+
+    let realityServerNames = "";
+    if (Array.isArray(reality.serverNames)) {
+      realityServerNames = reality.serverNames.join(", ");
+    } else if (typeof reality.serverNames === "string") {
+      realityServerNames = reality.serverNames;
+    }
+
+    let realityShortIds = "";
+    if (Array.isArray(reality.shortIds)) {
+      realityShortIds = reality.shortIds.filter(Boolean).join(", ");
+    } else if (typeof reality.shortIds === "string") {
+      realityShortIds = reality.shortIds;
+    }
+
+    let h2Host = "";
+    if (Array.isArray(h2.host)) {
+      h2Host = h2.host.join(", ");
+    } else if (typeof h2.host === "string") {
+      h2Host = h2.host;
+    }
+
+    const certObj = tls.certificates?.[0] || {};
+    let tlsCertFile = certObj.certificateFile || "";
+    let tlsKeyFile = certObj.keyFile || "";
+    let tlsCertPem = "";
+    let tlsKeyPem = "";
+
+    if (Array.isArray(certObj.certificate)) {
+      tlsCertPem = certObj.certificate.join("\n");
+    } else if (typeof certObj.certificate === "string") {
+      tlsCertPem = certObj.certificate;
+    }
+
+    if (Array.isArray(certObj.key)) {
+      tlsKeyPem = certObj.key.join("\n");
+    } else if (typeof certObj.key === "string") {
+      tlsKeyPem = certObj.key;
+    }
+
+    const tlsCertType = (tlsCertPem || tlsKeyPem) ? "pem" : "file";
+
+    return {
+      tag: ib.tag || `inbound-${idx + 1}`,
+      listen: ib.listen || "0.0.0.0",
+      port: Number(ib.port) || 443,
+      protocol: String(ib.protocol || "vless").toLowerCase(),
+      network: String(ss.network || "tcp").toLowerCase(),
+      security: String(ss.security || "none").toLowerCase(),
+      wsPath: ws.path || "/",
+      grpcServiceName: grpc.serviceName || "",
+      xhttpPath: xhttp.path || "/",
+      xhttpHost: xhttp.host || "",
+      xhttpMode: xhttp.mode || "auto",
+      httpupgradePath: httpupgrade.path || "/",
+      httpupgradeHost: httpupgrade.host || "",
+      kcpHeaderType: kcp.header?.type || "none",
+      kcpSeed: kcp.seed || "",
+      h2Path: h2.path || "/",
+      h2Host: h2Host,
+      tlsServerName: tls.serverName || "",
+      tlsCertType: tlsCertType,
+      tlsCertFile: tlsCertFile,
+      tlsKeyFile: tlsKeyFile,
+      tlsCertPem: tlsCertPem,
+      tlsKeyPem: tlsKeyPem,
+      realityDest: reality.dest || "www.microsoft.com:443",
+      realityServerNames: realityServerNames || "www.microsoft.com",
+      realityPrivateKey: reality.privateKey || "",
+      realityPublicKey: reality.publicKey || "",
+      realityShortIds: realityShortIds,
+      realitySpiderX: reality.spiderX || "/",
+      realityFingerprint: reality.fingerprint || ss.sockopt?.fingerprint || "chrome",
+      sniffing: ib.sniffing?.enabled !== false,
+      raw: JSON.parse(JSON.stringify(ib)),
+    };
+  }) : [];
+
+  const outbounds = Array.isArray(parsed.outbounds) ? parsed.outbounds : [{ tag: "direct", protocol: "freedom" }];
+  const rawOther = { ...parsed };
+  delete rawOther.inbounds;
+  delete rawOther.outbounds;
+
+  return {
+    error: null,
+    inbounds,
+    outbounds,
+    rawOther,
+  };
+}
+
+function serializeXrayConfig(model) {
+  const inbounds = (model.inbounds || []).map((inb, idx) => {
+    const proto = String(inb.protocol || "vless").toLowerCase();
+    const net = String(inb.network || "tcp").toLowerCase();
+    const sec = String(inb.security || "none").toLowerCase();
+
+    const ib = {
+      tag: inb.tag || (idx === 0 ? "vless-in" : `inbound-${idx + 1}`),
+      listen: inb.listen || "0.0.0.0",
+      port: Number(inb.port) || 443,
+      protocol: proto,
+      settings: {
+        clients: [], // Must remain empty: PasarGuard agent dynamically injects buyer clients
+        ...(proto === "vless" ? { decryption: "none" } : {}),
+      },
+      streamSettings: {
+        network: net,
+        security: sec,
+      },
+    };
+
+    if (inb.sniffing !== false) {
+      ib.sniffing = {
+        enabled: true,
+        destOverride: ["http", "tls", "quic"],
+      };
+    }
+
+    // Transport streamSettings
+    if (net === "ws") {
+      ib.streamSettings.wsSettings = {
+        path: inb.wsPath || "/",
+      };
+    } else if (net === "grpc") {
+      ib.streamSettings.grpcSettings = {
+        serviceName: inb.grpcServiceName || "grpc-service",
+      };
+    } else if (net === "xhttp") {
+      ib.streamSettings.xhttpSettings = {
+        path: inb.xhttpPath || "/",
+        mode: inb.xhttpMode || "auto",
+        ...(inb.xhttpHost ? { host: inb.xhttpHost } : {}),
+      };
+    } else if (net === "httpupgrade") {
+      ib.streamSettings.httpupgradeSettings = {
+        path: inb.httpupgradePath || "/",
+        ...(inb.httpupgradeHost ? { host: inb.httpupgradeHost } : {}),
+      };
+    } else if (net === "kcp") {
+      ib.streamSettings.kcpSettings = {
+        header: {
+          type: inb.kcpHeaderType || "none",
+        },
+        ...(inb.kcpSeed ? { seed: inb.kcpSeed } : {}),
+      };
+    } else if (net === "h2") {
+      const hosts = String(inb.h2Host || "").split(",").map((s) => s.trim()).filter(Boolean);
+      ib.streamSettings.httpSettings = {
+        path: inb.h2Path || "/",
+        ...(hosts.length ? { host: hosts } : {}),
+      };
+    }
+
+    // Security streamSettings
+    if (sec === "tls") {
+      let certs = [];
+      if (inb.tlsCertType === "pem" || (inb.tlsCertPem && inb.tlsKeyPem)) {
+        certs = [{
+          certificate: String(inb.tlsCertPem || "").split("\n").map((s) => s.replace(/\r$/, "")),
+          key: String(inb.tlsKeyPem || "").split("\n").map((s) => s.replace(/\r$/, "")),
+        }];
+      } else if (inb.tlsCertFile || inb.tlsKeyFile) {
+        certs = [{
+          certificateFile: inb.tlsCertFile || "",
+          keyFile: inb.tlsKeyFile || "",
+        }];
+      }
+      ib.streamSettings.tlsSettings = {
+        serverName: inb.tlsServerName || "",
+        certificates: certs,
+      };
+    } else if (sec === "reality") {
+      const sns = String(inb.realityServerNames || "")
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      const sids = String(inb.realityShortIds || "")
+        .split(",")
+        .map((s) => s.trim());
+      if (!sids.includes("")) sids.unshift(""); // Allow empty shortId
+
+      ib.streamSettings.realitySettings = {
+        show: false,
+        dest: inb.realityDest || "www.microsoft.com:443",
+        xver: 0,
+        serverNames: sns.length ? sns : ["www.microsoft.com"],
+        privateKey: inb.realityPrivateKey || "",
+        shortIds: sids,
+        spiderX: inb.realitySpiderX || "/",
+        fingerprint: inb.realityFingerprint || "chrome",
+      };
+      if (inb.realityPublicKey) {
+        ib.streamSettings.realitySettings.publicKey = inb.realityPublicKey;
+      }
+    }
+
+    return ib;
+  });
+
+  const full = {
+    log: model.rawOther?.log || { loglevel: "warning" },
+    ...(model.rawOther || {}),
+    inbounds,
+    outbounds: (model.outbounds && model.outbounds.length)
+      ? model.outbounds
+      : [{ tag: "direct", protocol: "freedom" }],
+  };
+
+  return JSON.stringify(full, null, 2);
+}
+
 // Ready-made Xray core templates for the node config editor. Keep `clients`
 // empty — the system injects users per tenant. The inbound tag should match the
 // node's PG_AGENT_FORCE_INBOUNDS (default "vless-in").
@@ -289,7 +602,7 @@ const CONFIG_TEMPLATES = [
     },
   },
   {
-    label: "VLESS + Reality (بدون دامنه — کلید را جایگزین کن)",
+    label: "VLESS + Reality + TCP (بدون دامنه / ضد فیلتر)",
     config: {
       log: { loglevel: "warning" },
       inbounds: [
@@ -299,7 +612,45 @@ const CONFIG_TEMPLATES = [
             realitySettings: { show: false, dest: "www.microsoft.com:443", xver: 0,
               serverNames: ["www.microsoft.com"],
               privateKey: "REPLACE_WITH_xray_x25519_PRIVATE_KEY",
-              shortIds: ["", "0123456789abcdef"] } },
+              shortIds: ["", "0123456789abcdef"],
+              spiderX: "/",
+              fingerprint: "chrome" } },
+          sniffing: { enabled: true, destOverride: ["http", "tls", "quic"] } },
+      ],
+      outbounds: [{ tag: "direct", protocol: "freedom" }],
+    },
+  },
+  {
+    label: "VLESS + Reality + xhttp (مدرن‌ترین ضد فیلتر CDN / تکه‌تکه)",
+    config: {
+      log: { loglevel: "warning" },
+      inbounds: [
+        { tag: "vless-in", listen: "0.0.0.0", port: 443, protocol: "vless",
+          settings: { clients: [], decryption: "none" },
+          streamSettings: { network: "xhttp", security: "reality",
+            xhttpSettings: { path: "/xhttp", mode: "auto" },
+            realitySettings: { show: false, dest: "www.microsoft.com:443", xver: 0,
+              serverNames: ["www.microsoft.com"],
+              privateKey: "REPLACE_WITH_xray_x25519_PRIVATE_KEY",
+              shortIds: ["", "0123456789abcdef"],
+              spiderX: "/",
+              fingerprint: "chrome" } },
+          sniffing: { enabled: true, destOverride: ["http", "tls", "quic"] } },
+      ],
+      outbounds: [{ tag: "direct", protocol: "freedom" }],
+    },
+  },
+  {
+    label: "VLESS + HTTPUpgrade + TLS (جایگزین فوق‌سبک WS برای CDN)",
+    config: {
+      log: { loglevel: "warning" },
+      inbounds: [
+        { tag: "vless-in", listen: "0.0.0.0", port: 443, protocol: "vless",
+          settings: { clients: [], decryption: "none" },
+          streamSettings: { network: "httpupgrade", security: "tls",
+            httpupgradeSettings: { path: "/upgrade" },
+            tlsSettings: { serverName: "your.domain.com",
+              certificates: [{ certificateFile: "/etc/ssl/your.crt", keyFile: "/etc/ssl/your.key" }] } },
           sniffing: { enabled: true, destOverride: ["http", "tls", "quic"] } },
       ],
       outbounds: [{ tag: "direct", protocol: "freedom" }],
@@ -555,50 +906,474 @@ function nodeEditModal(d) {
   );
 }
 
-// nodeConfigModal lets the operator edit and push a node's fixed Xray config.
+// nodeConfigModal lets the operator edit and push a node's fixed Xray config
+// with a full visual inbound form builder, Reality key generator, and raw JSON editor.
 async function nodeConfigModal(nodeID) {
   const res = await fetch(`/api/v1/nodes/${nodeID}/config`, {
     headers: { Authorization: "Bearer " + getToken() },
   });
   if (res.status === 401) { openTokenModal(); return; }
   const current = await res.text();
-  const pretty = (() => { try { return JSON.stringify(JSON.parse(current), null, 2); } catch { return current; } })();
-  const isEmpty = (() => { try { const o = JSON.parse(current); return !o.inbounds || o.inbounds.length === 0; } catch { return true; } })();
+
+  let configModel = parseXrayConfig(current);
+  if (!configModel.inbounds || configModel.inbounds.length === 0) {
+    // Default to a standard VLESS inbound if empty
+    configModel = parseXrayConfig(JSON.stringify(CONFIG_TEMPLATES[0].config));
+  }
 
   const tmplOptions = CONFIG_TEMPLATES.map((t, i) => `<option value="${i}">${esc(t.label)}</option>`).join("");
 
+  function renderInboundCard(inb, idx, totalCount) {
+    const isWs = inb.network === "ws";
+    const isGrpc = inb.network === "grpc";
+    const isXhttp = inb.network === "xhttp";
+    const isHttpupgrade = inb.network === "httpupgrade";
+    const isKcp = inb.network === "kcp";
+    const isH2 = inb.network === "h2";
+    const isTls = inb.security === "tls";
+    const isReality = inb.security === "reality";
+
+    return `
+      <div class="inbound-card" data-idx="${idx}">
+        <div class="inbound-card-header">
+          <div class="inbound-card-title">
+            <span>اینباند #${idx + 1}</span>
+            <span class="inbound-chip">${esc(inb.protocol.toUpperCase())}</span>
+            <span class="inbound-chip" style="background:var(--surface)">${esc(inb.network.toUpperCase())}</span>
+            ${inb.security !== "none" ? `<span class="inbound-chip" style="background:var(--ok);color:#fff">${esc(inb.security.toUpperCase())}</span>` : ""}
+          </div>
+          ${totalCount > 1 ? `<button class="btn sm danger" type="button" data-del-inb="${idx}" title="حذف اینباند">حذف</button>` : ""}
+        </div>
+
+        <div class="inbound-grid">
+          <div class="field">
+            <label>تگ (Tag)</label>
+            <input type="text" data-prop="tag" value="${esc(inb.tag)}" placeholder="vless-in" />
+          </div>
+          <div class="field">
+            <label>آدرس Listen</label>
+            <input type="text" data-prop="listen" value="${esc(inb.listen)}" placeholder="0.0.0.0" />
+          </div>
+          <div class="field">
+            <label>پورت (Port)</label>
+            <input type="number" data-prop="port" value="${esc(inb.port)}" placeholder="443" />
+          </div>
+          <div class="field">
+            <label>پروتکل (Protocol)</label>
+            <select data-prop="protocol">
+              <option value="vless" ${inb.protocol === "vless" ? "selected" : ""}>VLESS</option>
+              <option value="vmess" ${inb.protocol === "vmess" ? "selected" : ""}>VMess</option>
+              <option value="trojan" ${inb.protocol === "trojan" ? "selected" : ""}>Trojan</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>انتقال (Transport / Network)</label>
+            <select data-prop="network">
+              <option value="tcp" ${inb.network === "tcp" ? "selected" : ""}>TCP</option>
+              <option value="xhttp" ${inb.network === "xhttp" ? "selected" : ""}>xhttp (SplitHTTP — ضد فیلتر جدید)</option>
+              <option value="httpupgrade" ${inb.network === "httpupgrade" ? "selected" : ""}>HTTPUpgrade (کلادفلر / CDN سبک)</option>
+              <option value="ws" ${inb.network === "ws" ? "selected" : ""}>WebSocket (WS)</option>
+              <option value="grpc" ${inb.network === "grpc" ? "selected" : ""}>gRPC</option>
+              <option value="kcp" ${inb.network === "kcp" ? "selected" : ""}>mKCP (UDP)</option>
+              <option value="h2" ${inb.network === "h2" ? "selected" : ""}>HTTP/2</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>امنیت (Security / TLS)</label>
+            <select data-prop="security">
+              <option value="none" ${inb.security === "none" ? "selected" : ""}>None (بدون رمزنگاری)</option>
+              <option value="tls" ${inb.security === "tls" ? "selected" : ""}>TLS (گواهی SSL/دامنه)</option>
+              <option value="reality" ${inb.security === "reality" ? "selected" : ""}>Reality (ضد فیلتر بدون دامنه)</option>
+            </select>
+          </div>
+        </div>
+
+        <!-- xhttp Transport Settings -->
+        ${isXhttp ? `
+          <div class="inbound-grid" style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">
+            <div class="field">
+              <label>مسیر xhttp (Path)</label>
+              <input type="text" data-prop="xhttpPath" value="${esc(inb.xhttpPath || "/")}" placeholder="/xhttp" />
+            </div>
+            <div class="field">
+              <label>هاست xhttp (Host اختیاری)</label>
+              <input type="text" data-prop="xhttpHost" value="${esc(inb.xhttpHost || "")}" placeholder="cdn.example.com" />
+            </div>
+            <div class="field">
+              <label>حالت انتقال (Mode)</label>
+              <select data-prop="xhttpMode">
+                <option value="auto" ${(!inb.xhttpMode || inb.xhttpMode === "auto") ? "selected" : ""}>auto (خودکار — پیشنهادی)</option>
+                <option value="stream-up" ${inb.xhttpMode === "stream-up" ? "selected" : ""}>stream-up (استریم آپلود)</option>
+                <option value="packet-up" ${inb.xhttpMode === "packet-up" ? "selected" : ""}>packet-up (پکت آپلود)</option>
+                <option value="stream-one" ${inb.xhttpMode === "stream-one" ? "selected" : ""}>stream-one (تک استریم)</option>
+              </select>
+            </div>
+          </div>
+        ` : ""}
+
+        <!-- HTTPUpgrade Transport Settings -->
+        ${isHttpupgrade ? `
+          <div class="inbound-grid" style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">
+            <div class="field">
+              <label>مسیر HTTPUpgrade (Path)</label>
+              <input type="text" data-prop="httpupgradePath" value="${esc(inb.httpupgradePath || "/")}" placeholder="/upgrade" />
+            </div>
+            <div class="field">
+              <label>هاست HTTPUpgrade (Host اختیاری)</label>
+              <input type="text" data-prop="httpupgradeHost" value="${esc(inb.httpupgradeHost || "")}" placeholder="upgrade.example.com" />
+            </div>
+          </div>
+        ` : ""}
+
+        <!-- WS Transport Settings -->
+        ${isWs ? `
+          <div class="inbound-grid" style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">
+            <div class="field" style="grid-column: 1 / -1">
+              <label>مسیر وب‌سوکت (WS Path)</label>
+              <input type="text" data-prop="wsPath" value="${esc(inb.wsPath || "/")}" placeholder="/vless" />
+            </div>
+          </div>
+        ` : ""}
+
+        <!-- gRPC Transport Settings -->
+        ${isGrpc ? `
+          <div class="inbound-grid" style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">
+            <div class="field" style="grid-column: 1 / -1">
+              <label>نام سرویس gRPC (Service Name)</label>
+              <input type="text" data-prop="grpcServiceName" value="${esc(inb.grpcServiceName || "")}" placeholder="grpc-service" />
+            </div>
+          </div>
+        ` : ""}
+
+        <!-- mKCP Transport Settings -->
+        ${isKcp ? `
+          <div class="inbound-grid" style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">
+            <div class="field">
+              <label>نوع جعل هدر (Header Type)</label>
+              <select data-prop="kcpHeaderType">
+                <option value="none" ${(!inb.kcpHeaderType || inb.kcpHeaderType === "none") ? "selected" : ""}>none (ساده)</option>
+                <option value="wireguard" ${inb.kcpHeaderType === "wireguard" ? "selected" : ""}>wireguard (شبیه‌ساز وایرگارد)</option>
+                <option value="wechat-video" ${inb.kcpHeaderType === "wechat-video" ? "selected" : ""}>wechat-video (ویدیوکال)</option>
+                <option value="dtls" ${inb.kcpHeaderType === "dtls" ? "selected" : ""}>dtls 1.2</option>
+                <option value="srtp" ${inb.kcpHeaderType === "srtp" ? "selected" : ""}>srtp</option>
+                <option value="utp" ${inb.kcpHeaderType === "utp" ? "selected" : ""}>utp (بیت‌تورنت)</option>
+              </select>
+            </div>
+            <div class="field">
+              <label>رمز مبهم‌سازی (KCP Seed اختیاری)</label>
+              <input type="text" data-prop="kcpSeed" value="${esc(inb.kcpSeed || "")}" placeholder="seed password" />
+            </div>
+          </div>
+        ` : ""}
+
+        <!-- HTTP/2 Transport Settings -->
+        ${isH2 ? `
+          <div class="inbound-grid" style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">
+            <div class="field">
+              <label>مسیر HTTP/2 (Path)</label>
+              <input type="text" data-prop="h2Path" value="${esc(inb.h2Path || "/")}" placeholder="/h2" />
+            </div>
+            <div class="field">
+              <label>هاست‌های مجاز (Host — با کاما جدا کنید)</label>
+              <input type="text" data-prop="h2Host" value="${esc(inb.h2Host || "")}" placeholder="h2.example.com" />
+            </div>
+          </div>
+        ` : ""}
+
+        <!-- TLS Settings -->
+        ${isTls ? `
+          <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">
+            <div class="inbound-grid">
+              <div class="field">
+                <label>دامنه / SNI (Server Name)</label>
+                <input type="text" data-prop="tlsServerName" value="${esc(inb.tlsServerName)}" placeholder="your.domain.com" />
+              </div>
+              <div class="field">
+                <label>روش تعریف گواهی (Certificate Mode)</label>
+                <select data-prop="tlsCertType">
+                  <option value="file" ${(!inb.tlsCertType || inb.tlsCertType === "file") ? "selected" : ""}>مسیر فایل روی سرور (File Path)</option>
+                  <option value="pem" ${inb.tlsCertType === "pem" ? "selected" : ""}>محتوای متنی مستقیم (PEM Text)</option>
+                </select>
+              </div>
+            </div>
+
+            ${inb.tlsCertType === "pem" ? `
+              <div class="inbound-grid" style="margin-top:10px">
+                <div class="field" style="grid-column: 1 / -1">
+                  <label>محتوای متنی گواهی (Certificate PEM — شامل BEGIN و END)</label>
+                  <textarea data-prop="tlsCertPem" rows="5" placeholder="-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----" style="font-family:var(--font-mono);font-size:12px">${esc(inb.tlsCertPem || "")}</textarea>
+                </div>
+                <div class="field" style="grid-column: 1 / -1">
+                  <label>محتوای کلید خصوصی (Private Key PEM — شامل BEGIN و END)</label>
+                  <textarea data-prop="tlsKeyPem" rows="5" placeholder="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----" style="font-family:var(--font-mono);font-size:12px">${esc(inb.tlsKeyPem || "")}</textarea>
+                </div>
+              </div>
+            ` : `
+              <div class="inbound-grid" style="margin-top:10px">
+                <div class="field">
+                  <label>مسیر فایل گواهی (Cert File)</label>
+                  <input type="text" data-prop="tlsCertFile" value="${esc(inb.tlsCertFile || "")}" placeholder="/etc/ssl/cert.pem" />
+                </div>
+                <div class="field">
+                  <label>مسیر فایل کلید (Key File)</label>
+                  <input type="text" data-prop="tlsKeyFile" value="${esc(inb.tlsKeyFile || "")}" placeholder="/etc/ssl/key.pem" />
+                </div>
+              </div>
+            `}
+          </div>
+        ` : ""}
+
+        <!-- Reality Settings -->
+        ${isReality ? `
+          <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">
+            <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:8px">
+              <span style="font-size:12.5px;font-weight:700;color:var(--accent)">تنظیمات پروتکل Reality</span>
+              <button class="btn-gen-keys" type="button" data-gen-reality="${idx}">
+                🎲 تولید خودکار کلیدهای Reality
+              </button>
+            </div>
+            <div class="inbound-grid">
+              <div class="field">
+                <label>هدف فریب (Dest)</label>
+                <input type="text" data-prop="realityDest" value="${esc(inb.realityDest)}" placeholder="www.microsoft.com:443" />
+              </div>
+              <div class="field">
+                <label>دامنه‌های مجاز (Server Names — با کاما جدا کنید)</label>
+                <input type="text" data-prop="realityServerNames" value="${esc(inb.realityServerNames)}" placeholder="www.microsoft.com, learn.microsoft.com" />
+              </div>
+              <div class="field">
+                <label>شناسه کوتاه (Short IDs — هگز ۸ یا ۱۶ کاراکتر)</label>
+                <input type="text" data-prop="realityShortIds" value="${esc(inb.realityShortIds)}" placeholder="0123456789abcdef" />
+              </div>
+              <div class="field">
+                <label>مسیر خزنده (SpiderX)</label>
+                <input type="text" data-prop="realitySpiderX" value="${esc(inb.realitySpiderX || "/")}" placeholder="/" />
+              </div>
+              <div class="field">
+                <label>فینگرپرینت کلاینت (uTLS Fingerprint)</label>
+                <select data-prop="realityFingerprint">
+                  <option value="chrome" ${(!inb.realityFingerprint || inb.realityFingerprint === "chrome") ? "selected" : ""}>chrome (پیش‌فرض)</option>
+                  <option value="firefox" ${inb.realityFingerprint === "firefox" ? "selected" : ""}>firefox</option>
+                  <option value="safari" ${inb.realityFingerprint === "safari" ? "selected" : ""}>safari</option>
+                  <option value="ios" ${inb.realityFingerprint === "ios" ? "selected" : ""}>ios</option>
+                  <option value="android" ${inb.realityFingerprint === "android" ? "selected" : ""}>android</option>
+                  <option value="edge" ${inb.realityFingerprint === "edge" ? "selected" : ""}>edge</option>
+                  <option value="random" ${inb.realityFingerprint === "random" ? "selected" : ""}>random</option>
+                  <option value="randomized" ${inb.realityFingerprint === "randomized" ? "selected" : ""}>randomized</option>
+                </select>
+              </div>
+              <div class="field" style="grid-column: 1 / -1">
+                <label>کلید خصوصی (Private Key)</label>
+                <input type="text" data-prop="realityPrivateKey" value="${esc(inb.realityPrivateKey)}" placeholder="Base64 RawURL Private Key" style="font-family:var(--font-mono);font-size:12px" />
+              </div>
+              ${inb.realityPublicKey ? `
+                <div class="field" style="grid-column: 1 / -1">
+                  <label>کلید عمومی (Public Key — ذخیره‌شده برای لینک اتصال)</label>
+                  <div class="row" style="gap:6px">
+                    <input readonly value="${esc(inb.realityPublicKey)}" style="font-family:var(--font-mono);font-size:12px;flex:1" />
+                    <button class="btn sm ghost" type="button" data-copy-pub="${esc(inb.realityPublicKey)}">کپی</button>
+                  </div>
+                </div>
+              ` : ""}
+            </div>
+          </div>
+        ` : ""}
+      </div>
+    `;
+  }
+
   modal(
     "کانفیگ هسته‌ی نود",
-    `<p class="muted" style="font-size:12.5px;margin:0 0 8px">کانفیگ ثابت Xray (JSON). با اعمال، روی نود push و هسته راه‌اندازی می‌شود. آرایه‌ی <span class="mono">clients</span> را خالی بگذار؛ کاربرها خودکار تزریق می‌شوند.</p>
-     ${isEmpty ? `<p class="muted" style="font-size:12.5px;color:var(--warn);margin:0 0 8px">کانفیگ این نود خالی است — یک قالب انتخاب کن تا پر شود، سپس مقادیر را ویرایش و اعمال کن.</p>` : ""}
-     <div class="field"><label>قالب آماده</label>
-       <select id="cfgTmpl"><option value="">— انتخاب قالب —</option>${tmplOptions}</select></div>
-     <div class="field"><textarea id="cfgEditor" rows="16" spellcheck="false" style="font-family:ui-monospace,monospace;font-size:12.5px">${esc(pretty)}</textarea></div>
-     <div class="actions"><button class="btn primary" id="cfgApply">اعمال روی نود</button><button class="btn ghost" id="cfgCancel">انصراف</button></div>`,
+    `<div class="cfg-mode-tabs">
+       <button class="cfg-mode-tab active" type="button" id="tabVisual">🎛️ ویرایشگر گرافیکی</button>
+       <button class="cfg-mode-tab" type="button" id="tabRaw">📝 کد خام JSON</button>
+     </div>
+     <div class="field" style="margin-bottom:12px">
+       <label>بارگذاری از قالب آماده</label>
+       <select id="cfgTmpl"><option value="">— انتخاب قالب برای بارگذاری —</option>${tmplOptions}</select>
+     </div>
+     <div id="cfgVisualSection">
+       <p class="muted" style="font-size:12px;margin:0 0 10px">اینباندهای هسته را به‌صورت گرافیکی تنظیم کنید. خریداران و کاربران به‌صورت پویا توسط سرویس نود تزریق می‌شوند.</p>
+       <div id="cfgInboundsList"></div>
+       <button class="btn ghost sm" type="button" id="cfgAddInbound" style="border:1px dashed var(--border);width:100%;margin-top:6px">+ افزودن اینباند جدید</button>
+     </div>
+     <div id="cfgRawSection" style="display:none">
+       <div class="field">
+         <label>JSON کامل کانفیگ Xray</label>
+         <textarea id="cfgEditor" rows="18" spellcheck="false" style="font-family:var(--font-mono);font-size:12px">${esc(serializeXrayConfig(configModel))}</textarea>
+       </div>
+     </div>
+     <div class="actions">
+       <button class="btn primary" id="cfgApply">اعمال روی نود</button>
+       <button class="btn ghost" id="cfgCancel">انصراف</button>
+     </div>`,
     (root) => {
-      const editor = root.querySelector("#cfgEditor");
+      let activeMode = "visual";
+      const listEl = root.querySelector("#cfgInboundsList");
+      const editorEl = root.querySelector("#cfgEditor");
+      const visualSec = root.querySelector("#cfgVisualSection");
+      const rawSec = root.querySelector("#cfgRawSection");
+      const tabVisual = root.querySelector("#tabVisual");
+      const tabRaw = root.querySelector("#tabRaw");
+
+      function attachInboundEvents() {
+        listEl.querySelectorAll("[data-prop]").forEach((input) => {
+          const handler = (e) => {
+            const card = e.target.closest(".inbound-card");
+            if (!card) return;
+            const idx = Number(card.dataset.idx);
+            const prop = e.target.dataset.prop;
+            configModel.inbounds[idx][prop] = e.target.value.trim();
+
+            // Re-render if protocol, transport, security, or certificate mode changed
+            if (prop === "protocol" || prop === "network" || prop === "security" || prop === "tlsCertType") {
+              renderInbounds();
+            }
+          };
+          input.oninput = handler;
+          input.onchange = handler;
+        });
+
+        listEl.querySelectorAll("[data-del-inb]").forEach((btn) => {
+          btn.onclick = (e) => {
+            const idx = Number(e.currentTarget.dataset.delInb);
+            if (configModel.inbounds.length <= 1) return;
+            configModel.inbounds.splice(idx, 1);
+            renderInbounds();
+            toast("اینباند حذف شد");
+          };
+        });
+
+        listEl.querySelectorAll("[data-gen-reality]").forEach((btn) => {
+          btn.onclick = (e) => {
+            const idx = Number(e.currentTarget.dataset.genReality);
+            const keys = generateRealityKeys();
+            configModel.inbounds[idx].realityPrivateKey = keys.privateKey;
+            configModel.inbounds[idx].realityPublicKey = keys.publicKey;
+            configModel.inbounds[idx].realityShortIds = keys.shortId;
+            renderInbounds();
+            toast("کلیدهای جدید Reality و ShortID با موفقیت تولید شدند");
+          };
+        });
+
+        listEl.querySelectorAll("[data-copy-pub]").forEach((btn) => {
+          btn.onclick = (e) => {
+            const text = e.currentTarget.dataset.copyPub;
+            if (navigator.clipboard) navigator.clipboard.writeText(text);
+            toast("کلید عمومی کپی شد");
+          };
+        });
+      }
+
+      function renderInbounds() {
+        listEl.innerHTML = configModel.inbounds.map((inb, i) =>
+          renderInboundCard(inb, i, configModel.inbounds.length)
+        ).join("");
+        attachInboundEvents();
+      }
+
+      renderInbounds();
+
+      // Mode switching
+      tabVisual.onclick = () => {
+        if (activeMode === "visual") return;
+        const res = parseXrayConfig(editorEl.value.trim());
+        if (res.error) {
+          toast(res.error, "err");
+          return;
+        }
+        configModel = res;
+        activeMode = "visual";
+        tabVisual.classList.add("active");
+        tabRaw.classList.remove("active");
+        visualSec.style.display = "block";
+        rawSec.style.display = "none";
+        renderInbounds();
+      };
+
+      tabRaw.onclick = () => {
+        if (activeMode === "raw") return;
+        editorEl.value = serializeXrayConfig(configModel);
+        activeMode = "raw";
+        tabRaw.classList.add("active");
+        tabVisual.classList.remove("active");
+        rawSec.style.display = "block";
+        visualSec.style.display = "none";
+      };
+
+      // Template selection
       root.querySelector("#cfgTmpl").onchange = (e) => {
         const idx = e.target.value;
         if (idx === "") return;
         const t = CONFIG_TEMPLATES[Number(idx)];
         if (!t) return;
-        if (editor.value.trim() && editor.value.trim() !== "{}" && !confirm("محتوای فعلی ویرایشگر با قالب جایگزین شود؟")) {
+        if (!confirm("قالب «" + t.label + "» بارگذاری شود؟ تنظیمات فعلی جایگزین خواهند شد.")) {
           e.target.value = "";
           return;
         }
-        editor.value = JSON.stringify(t.config, null, 2);
-        toast("قالب «" + t.label + "» بارگذاری شد — مقادیر را ویرایش کن");
+        configModel = parseXrayConfig(JSON.stringify(t.config));
+        editorEl.value = serializeXrayConfig(configModel);
+        renderInbounds();
+        toast("قالب «" + t.label + "» بارگذاری شد");
+        e.target.value = "";
       };
+
+      // Add Inbound
+      root.querySelector("#cfgAddInbound").onclick = () => {
+        const nextIdx = configModel.inbounds.length + 1;
+        configModel.inbounds.push({
+          tag: "inbound-" + nextIdx,
+          listen: "0.0.0.0",
+          port: 443 + (nextIdx - 1),
+          protocol: "vless",
+          network: "tcp",
+          security: "none",
+          wsPath: "/vless",
+          grpcServiceName: "",
+          tlsServerName: "",
+          tlsCertFile: "",
+          tlsKeyFile: "",
+          realityDest: "www.microsoft.com:443",
+          realityServerNames: "www.microsoft.com",
+          realityPrivateKey: "",
+          realityPublicKey: "",
+          realityShortIds: "",
+          sniffing: true,
+        });
+        renderInbounds();
+        toast("اینباند جدید اضافه شد");
+      };
+
       root.querySelector("#cfgCancel").onclick = closeModal;
+
+      // Apply
       root.querySelector("#cfgApply").onclick = () =>
         guard(async () => {
-          const raw = editor.value.trim();
-          if (!raw) throw new Error("کانفیگ خالی است");
-          try { JSON.parse(raw); } catch { throw new Error("JSON نامعتبر است"); }
+          let rawPayload;
+          if (activeMode === "visual") {
+            if (!configModel.inbounds || !configModel.inbounds.length) {
+              throw new Error("حداقل یک اینباند باید تعریف شده باشد");
+            }
+            for (const inb of configModel.inbounds) {
+              const p = Number(inb.port);
+              if (!p || p < 1 || p > 65535) {
+                throw new Error(`پورت نامعتبر است: ${inb.port}`);
+              }
+              if (!inb.tag) {
+                throw new Error("تگ اینباند نمی‌تواند خالی باشد");
+              }
+            }
+            rawPayload = serializeXrayConfig(configModel);
+          } else {
+            rawPayload = editorEl.value.trim();
+            if (!rawPayload) throw new Error("کانفیگ خالی است");
+            try { JSON.parse(rawPayload); } catch { throw new Error("JSON نامعتبر است"); }
+          }
+
           const r = await fetch(`/api/v1/nodes/${nodeID}/config`, {
             method: "PUT",
             headers: { "Content-Type": "application/json", Authorization: "Bearer " + getToken() },
-            body: raw,
+            body: rawPayload,
           });
           if (!r.ok) {
             let msg = "خطا " + r.status;
@@ -609,7 +1384,8 @@ async function nodeConfigModal(nodeID) {
           toast("کانفیگ روی نود اعمال شد");
           route();
         });
-    }
+    },
+    "modal-lg"
   );
 }
 function nodeModal() {
@@ -1040,4 +1816,14 @@ async function viewWebhooks(view) {
         toast("وب‌هوک ثبت شد");
       }
     );
+}
+
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = {
+    curve25519,
+    generateRealityKeys,
+    parseXrayConfig,
+    serializeXrayConfig,
+    CONFIG_TEMPLATES,
+  };
 }
