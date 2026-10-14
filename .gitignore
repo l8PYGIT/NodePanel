@@ -6,6 +6,7 @@
 # build output
 /panel
 /panel.exe
+/dist/
 
 # local dev scratch
 /.sdd/
