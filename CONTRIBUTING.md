@@ -1,10 +1,10 @@
-# Contributing to NodePanel
+﻿# Contributing to NodePanel
 
 NodePanel is the control plane for selling node access: it manages a fleet of
-[NodeAgent](https://github.com/loopy-iri/NodeAgent) nodes, customers, plans and
+[NodeAgent](https://github.com/l8PYGIT/NodeAgent) nodes, customers, plans and
 subscriptions, and exposes usage to an external sales bot. Thanks for helping!
 
-> Repo: https://github.com/loopy-iri/NodePanel · Node: https://github.com/loopy-iri/NodeAgent
+> Repo: https://github.com/l8PYGIT/NodePanel · Node: https://github.com/l8PYGIT/NodeAgent
 > Full guide: the [`docs/wiki/`](docs/wiki/Home.md) folder (also published as the Wiki).
 
 ## Scope (important)

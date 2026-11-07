@@ -1,13 +1,13 @@
-<div align="center">
+﻿<div align="center">
 
 ![NodePanel Banner](docs/images/banner.svg)
 
 # NodePanel — Control Plane for Selling Node Access
 
-[![Release](https://img.shields.io/badge/Release-v0.8.0-6366f1?style=for-the-badge&logo=github)](https://github.com/loopy-iri/NodePanel/releases)
+[![Release](https://img.shields.io/badge/Release-v0.9.0-6366f1?style=for-the-badge&logo=github)](https://github.com/l8PYGIT/NodePanel/releases)
 [![Go Version](https://img.shields.io/badge/Go-1.22+-00ADD8?style=for-the-badge&logo=go&logoColor=white)](https://go.dev/)
 [![License](https://img.shields.io/badge/License-MIT-10b981?style=for-the-badge)](LICENSE)
-[![Status](https://img.shields.io/badge/Tests-100%25%20Passing-22c55e?style=for-the-badge&logo=githubactions&logoColor=white)](https://github.com/loopy-iri/NodePanel)
+[![Status](https://img.shields.io/badge/Tests-100%25%20Passing-22c55e?style=for-the-badge&logo=githubactions&logoColor=white)](https://github.com/l8PYGIT/NodePanel)
 [![Architecture](https://img.shields.io/badge/Architecture-Dedicated%20%7C%20Shared-8b5cf6?style=for-the-badge)](docs/images/architecture.svg)
 [![OpenAPI](https://img.shields.io/badge/API-OpenAPI%203.0-f59e0b?style=for-the-badge&logo=openapiinitiative&logoColor=white)](http://localhost:8080/docs)
 
@@ -16,7 +16,7 @@
   <i>ایزولاسیون کامل چند-مستأجری • مسیریابی پویا SNI روی پورت 443 • هشدارهای خودکار وب‌هوک ظرفیت</i>
 </p>
 
-[گزارش باگ](https://github.com/loopy-iri/NodePanel/issues) · [مستندات کامل ویکی](docs/wiki/Home.md) · [مخزن عامل نود (NodeAgent)](https://github.com/loopy-iri/NodeAgent)
+[گزارش باگ](https://github.com/l8PYGIT/NodePanel/issues) · [مستندات کامل ویکی](docs/wiki/Home.md) · [مخزن عامل نود (NodeAgent)](https://github.com/l8PYGIT/NodeAgent)
 
 </div>
 
@@ -76,7 +76,7 @@
 ### نصب خودکار با اسکریپت (سیستم‌های مبتنی بر لینوکس / systemd)
 ```bash
 # نصب خودکار باینری آماده + سرویس systemd:
-sudo bash -c "$(curl -sL https://raw.githubusercontent.com/loopy-iri/NodePanel/main/scripts/pg-panel.sh)" @ install --port 8080
+sudo bash -c "$(curl -sL https://raw.githubusercontent.com/l8PYGIT/NodePanel/main/scripts/pg-panel.sh)" @ install --port 8080
 ```
 
 ### اجرای محلی جهت توسعه و تست

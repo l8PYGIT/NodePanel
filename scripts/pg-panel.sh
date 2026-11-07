@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+﻿#!/usr/bin/env bash
 #
 # pg-panel.sh — installer/manager for the PasarGuard node-selling control panel.
 #
@@ -7,12 +7,12 @@
 # in the binary.
 #
 # One-line install:
-#   sudo bash -c "$(curl -sL https://raw.githubusercontent.com/loopy-iri/NodePanel/main/scripts/pg-panel.sh)" @ install
+#   sudo bash -c "$(curl -sL https://raw.githubusercontent.com/l8PYGIT/NodePanel/main/scripts/pg-panel.sh)" @ install
 #
 set -euo pipefail
 
 # ---------- globals ----------
-GH_REPO="${GH_REPO:-loopy-iri/NodePanel}"
+GH_REPO="${GH_REPO:-l8PYGIT/NodePanel}"
 RAW_SCRIPT_URL="${RAW_SCRIPT_URL:-https://raw.githubusercontent.com/${GH_REPO}/main/scripts/pg-panel.sh}"
 BIN_NAME="pg-panel"
 # Instance name (overridable with --name) decides paths/service/CLI name.
